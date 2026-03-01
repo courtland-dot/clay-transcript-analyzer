@@ -7,7 +7,8 @@ from pydantic import BaseModel, Field
 
 # --- Env ---
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+# Use an alias by default so you don't get stuck on a dated model string
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
 AUTH_TOKEN = os.environ.get("ANALYZER_AUTH_TOKEN", "")
 
 app = FastAPI()
@@ -83,9 +84,9 @@ Return JSON with this schema:
 Rules:
 - Output JSON only.
 - Keep verbatim fields short (<= 240 chars).
-- \"normalized\" should be reusable as a FAQ/blog title.
-- \"tags\" should include specific systems/terms if present (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
-- Set temperature to 0 (handled by caller) and do not add creative content.
+- "normalized" should be reusable as a FAQ/blog title.
+- "tags" should include specific systems/terms if present (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
+- Do not add creative content.
 
 Inputs:
 clari_call_id: {payload.clari_call_id or ""}
@@ -99,6 +100,10 @@ transcript:
 
 
 def call_claude(prompt: str) -> dict:
+    """
+    Calls Anthropic Messages API and returns parsed JSON.
+    Includes defensive error reporting (status + body) and robust JSON extraction fallback.
+    """
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": CLAUDE_API_KEY,
@@ -111,17 +116,49 @@ def call_claude(prompt: str) -> dict:
         "temperature": 0,
         "messages": [{"role": "user", "content": prompt}],
     }
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=120)
-    r.raise_for_status()
 
-    content = r.json().get("content", [])
-    if not content or "text" not in content[0]:
-        raise ValueError("Claude response missing content text")
+    r = requests.post(url, headers=headers, json=body, timeout=120)
 
-    raw_text = content[0]["text"].strip()
+    # Provide the actual Anthropic error body so debugging is instant (invalid key/model/etc.)
+    if r.status_code >= 400:
+        raise ValueError(f"Anthropic error {r.status_code}: {r.text[:2000]}")
 
-    # Sometimes models wrap JSON in whitespace; we still require strict parse.
-    return json.loads(raw_text)
+    data = r.json()
+
+    # Messages API returns content blocks; concatenate text blocks
+    content_blocks = data.get("content", []) or []
+    text_parts: list[str] = []
+    for b in content_blocks:
+        if isinstance(b, dict) and b.get("type") == "text" and "text" in b:
+            text_parts.append(b["text"])
+
+    raw_text = "".join(text_parts).strip()
+    if not raw_text:
+        raise ValueError(f"Claude response missing text content: {json.dumps(data)[:2000]}")
+
+    # Strict parse first
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        # Fallback: extract the first JSON object/array from the response
+        start_obj = raw_text.find("{")
+        start_arr = raw_text.find("[")
+        starts = [i for i in (start_obj, start_arr) if i != -1]
+        if not starts:
+            raise ValueError(f"Claude returned non-JSON text (first 500 chars): {raw_text[:500]}")
+
+        start = min(starts)
+        trimmed = raw_text[start:].strip()
+
+        # Attempt to trim trailing junk by finding the last closing brace/bracket
+        end_obj = trimmed.rfind("}")
+        end_arr = trimmed.rfind("]")
+        end = max(end_obj, end_arr)
+        if end == -1:
+            raise ValueError(f"Claude returned incomplete JSON (first 500 chars): {trimmed[:500]}")
+
+        candidate = trimmed[: end + 1]
+        return json.loads(candidate)
 
 
 @app.get("/health")
@@ -133,12 +170,15 @@ def health():
 def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)):
     # Optional shared-secret gate
     if AUTH_TOKEN:
-        if not authorization or authorization != f"Bearer {AUTH_TOKEN}":
+        expected = f"bearer {AUTH_TOKEN}".strip().lower()
+        got = (authorization or "").strip().lower()
+        if got != expected:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     transcript = payload.transcript or ""
+
+    # Short transcript guard (keeps costs low and avoids low-signal junk)
     if len(transcript) < 400:
-        # Return column-friendly flat fields for Clay mapping
         base = {
             "call_id": payload.clari_call_id or "",
             "questions": [],
@@ -173,16 +213,20 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
         buying_signals = result.get("buying_signals", []) or []
         topic_tags = result.get("topic_tags", []) or []
 
-        evidence_quotes = []
+        # Gather a compact set of receipts for quick human validation
+        evidence_quotes: list[str] = []
         for q in questions[:25]:
-            if q.get("evidence_quote"):
+            if isinstance(q, dict) and q.get("evidence_quote"):
                 evidence_quotes.append(q["evidence_quote"])
         for o in objections[:25]:
-            if o.get("evidence_quote"):
+            if isinstance(o, dict) and o.get("evidence_quote"):
                 evidence_quotes.append(o["evidence_quote"])
 
-        top_bullets = []
+        # Friendly bullets for quick scanning
+        top_bullets: list[str] = []
         for q in questions[:7]:
+            if not isinstance(q, dict):
+                continue
             norm = q.get("normalized") or q.get("verbatim")
             if norm:
                 top_bullets.append(f"- {norm}")
@@ -202,7 +246,6 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
         }
 
     except Exception as e:
-        # Return error fields in a way Clay can map
         return {
             "analysis_status": "error",
             "analysis_error": str(e)[:4000],
