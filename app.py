@@ -7,9 +7,12 @@ from pydantic import BaseModel, Field
 
 # --- Env ---
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
-# Use an alias by default so you don't get stuck on a dated model string
+# Choose a valid model for your Anthropic account (you verified these via /v1/models)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 AUTH_TOKEN = os.environ.get("ANALYZER_AUTH_TOKEN", "")
+
+# Domains to suppress (internal Regal speakers)
+REGAL_DOMAINS = ["regalvoice.com", "regal.ai", "regal.io"]
 
 app = FastAPI()
 
@@ -24,6 +27,35 @@ class AnalyzeIn(BaseModel):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def extract_domain(s: str) -> str:
+    """
+    Best-effort extraction of domain from a speaker token (typically email).
+    Returns "" if not present.
+    """
+    if not s:
+        return ""
+    s = s.strip().lower()
+    if "@" in s:
+        return s.split("@")[-1].strip()
+    return ""
+
+
+def classify_speaker(speaker: str | None) -> tuple[str, str]:
+    """
+    Returns (speaker_type, speaker_company_domain).
+    speaker_type: prospect | rep | unknown
+    speaker_company_domain: domain if email present else ""
+    """
+    if not speaker:
+        return "unknown", ""
+    domain = extract_domain(speaker)
+    if not domain:
+        return "unknown", ""
+    if any(d in domain for d in REGAL_DOMAINS):
+        return "rep", domain
+    return "prospect", domain
 
 
 def build_prompt(payload: AnalyzeIn) -> str:
@@ -43,6 +75,9 @@ Return JSON with this schema:
   "questions": [
     {{
       "verbatim": "",
+      "speaker": "",
+      "speaker_company": "",
+      "speaker_type": "prospect|rep|unknown",
       "normalized": "",
       "category": "integration|security|pricing|implementation|product|roi|timeline|other",
       "tags": ["..."],
@@ -53,6 +88,9 @@ Return JSON with this schema:
   "objections": [
     {{
       "verbatim": "",
+      "speaker": "",
+      "speaker_company": "",
+      "speaker_type": "prospect|rep|unknown",
       "category": "integration|security|pricing|implementation|product|roi|timeline|other",
       "evidence_quote": "",
       "confidence": 0.0
@@ -62,6 +100,9 @@ Return JSON with this schema:
     {{
       "type": "feature_request|bug|confusion|missing_capability|competitor_comparison|implementation_friction",
       "verbatim": "",
+      "speaker": "",
+      "speaker_company": "",
+      "speaker_type": "prospect|rep|unknown",
       "evidence_quote": ""
     }}
   ],
@@ -69,6 +110,9 @@ Return JSON with this schema:
     {{
       "type": "exec_sponsorship|clear_success_criteria|urgency|strong_value_alignment|procurement_motion|next_steps_committed",
       "verbatim": "",
+      "speaker": "",
+      "speaker_company": "",
+      "speaker_type": "prospect|rep|unknown",
       "evidence_quote": "",
       "confidence": 0.0
     }}
@@ -87,6 +131,14 @@ Rules:
 - "normalized" should be reusable as a FAQ/blog title.
 - "tags" should include specific systems/terms if present (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
 - Do not add creative content.
+
+Speaker Attribution Rules:
+- Transcripts contain speaker identifiers formatted like "email@company.com:"
+- Extract the speaker EXACTLY as written before the colon for each item’s evidence_quote.
+- speaker_company should be the email domain.
+- speaker_type should be "rep" if domain contains regalvoice.com, regal.ai, or regal.io, otherwise "prospect".
+- Never infer speakers.
+- Prefer prospect-spoken items when possible.
 
 Inputs:
 clari_call_id: {payload.clari_call_id or ""}
@@ -176,9 +228,10 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     transcript = payload.transcript or ""
+    is_too_short = len(transcript) < 400
 
     # Short transcript guard (keeps costs low and avoids low-signal junk)
-    if len(transcript) < 400:
+    if is_too_short:
         base = {
             "call_id": payload.clari_call_id or "",
             "questions": [],
@@ -207,26 +260,56 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
         prompt = build_prompt(payload)
         result = call_claude(prompt)
 
-        questions = result.get("questions", []) or []
-        objections = result.get("objections", []) or []
-        product_feedback = result.get("product_feedback", []) or []
-        buying_signals = result.get("buying_signals", []) or []
+        # Enforce quality flags deterministically (don't let the model set these incorrectly)
+        qf = (result.get("quality_flags") or {})
+        qf["transcript_too_short"] = is_too_short
+        qf["low_signal"] = bool(qf.get("low_signal", False))
+        result["quality_flags"] = qf
+
+        def normalize_and_filter(items):
+            cleaned = []
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+
+                speaker = item.get("speaker") or ""
+                speaker_type, company = classify_speaker(speaker)
+
+                item["speaker_type"] = item.get("speaker_type") or speaker_type
+                item["speaker_company"] = item.get("speaker_company") or company
+
+                # Suppress internal Regal speakers
+                if speaker_type == "rep":
+                    continue
+
+                cleaned.append(item)
+            return cleaned
+
+        questions = normalize_and_filter(result.get("questions", []) or [])
+        objections = normalize_and_filter(result.get("objections", []) or [])
+        product_feedback = normalize_and_filter(result.get("product_feedback", []) or [])
+        buying_signals = normalize_and_filter(result.get("buying_signals", []) or [])
+
+        # Replace with filtered versions so extraction_json is buyer-only too
+        result["questions"] = questions
+        result["objections"] = objections
+        result["product_feedback"] = product_feedback
+        result["buying_signals"] = buying_signals
+
         topic_tags = result.get("topic_tags", []) or []
 
         # Gather a compact set of receipts for quick human validation
         evidence_quotes: list[str] = []
         for q in questions[:25]:
-            if isinstance(q, dict) and q.get("evidence_quote"):
+            if q.get("evidence_quote"):
                 evidence_quotes.append(q["evidence_quote"])
         for o in objections[:25]:
-            if isinstance(o, dict) and o.get("evidence_quote"):
+            if o.get("evidence_quote"):
                 evidence_quotes.append(o["evidence_quote"])
 
         # Friendly bullets for quick scanning
         top_bullets: list[str] = []
         for q in questions[:7]:
-            if not isinstance(q, dict):
-                continue
             norm = q.get("normalized") or q.get("verbatim")
             if norm:
                 top_bullets.append(f"- {norm}")
