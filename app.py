@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 # --- Env ---
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
 # Use an alias by default so you don't get stuck on a dated model string
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 AUTH_TOKEN = os.environ.get("ANALYZER_AUTH_TOKEN", "")
 
 app = FastAPI()
