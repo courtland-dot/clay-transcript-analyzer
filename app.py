@@ -1,167 +1,156 @@
 import os
 import json
+import re
 from datetime import datetime, timezone
 import requests
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
-# --- Env ---
+# =========================
+# ENV
+# =========================
+
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
-# Choose a valid model for your Anthropic account (you verified these via /v1/models)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 AUTH_TOKEN = os.environ.get("ANALYZER_AUTH_TOKEN", "")
 
-# Domains to suppress (internal Regal speakers)
-REGAL_DOMAINS = ["regalvoice.com", "regal.ai", "regal.io"]
+REGAL_EMPLOYEE_NAMES = set(
+    n.strip().lower()
+    for n in os.environ.get("REGAL_EMPLOYEE_NAMES", "").split(",")
+    if n.strip()
+)
+
+REGAL_DOMAINS = [
+    d.strip().lower()
+    for d in os.environ.get("REGAL_DOMAINS", "").split(",")
+    if d.strip()
+]
 
 app = FastAPI()
 
+# =========================
+# MODELS
+# =========================
 
 class AnalyzeIn(BaseModel):
     clari_call_id: str | None = None
-    salesforce_opp_id: str | None = None
-    stage_at_time: str | None = None
-    segment: str | None = None
     transcript: str = Field(..., min_length=1)
 
+# =========================
+# HELPERS
+# =========================
 
-def now_iso() -> str:
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def extract_domain(s: str) -> str:
-    """
-    Best-effort extraction of domain from a speaker token (typically email).
-    Returns "" if not present.
-    """
-    if not s:
-        return ""
-    s = s.strip().lower()
-    if "@" in s:
-        return s.split("@")[-1].strip()
-    return ""
+EMAIL_REGEX = r'([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})'
 
 
-def classify_speaker(speaker: str | None) -> tuple[str, str]:
-    """
-    Returns (speaker_type, speaker_company_domain).
-    speaker_type: prospect | rep | unknown
-    speaker_company_domain: domain if email present else ""
-    """
-    if not speaker:
-        return "unknown", ""
-    domain = extract_domain(speaker)
-    if not domain:
-        return "unknown", ""
-    if any(d in domain for d in REGAL_DOMAINS):
-        return "rep", domain
-    return "prospect", domain
+def parse_speaker(raw_line: str):
+
+    match = re.match(r"^(.*?):", raw_line)
+    if not match:
+        return None, None, None
+
+    speaker_raw = match.group(1).strip()
+
+    email_match = re.search(EMAIL_REGEX, speaker_raw)
+
+    if email_match:
+        email = email_match.group(0)
+        domain = email_match.group(2).lower()
+
+        name_guess = speaker_raw.replace(email, "").strip()
+
+        speaker_display = name_guess if name_guess else email.split("@")[0]
+        speaker_company = domain
+
+        if (
+            domain in REGAL_DOMAINS
+            or speaker_display.lower() in REGAL_EMPLOYEE_NAMES
+        ):
+            speaker_type = "regal"
+        else:
+            speaker_type = "prospect"
+
+        return speaker_display, email, speaker_type
+
+    name = speaker_raw.strip()
+
+    if name.lower() in REGAL_EMPLOYEE_NAMES:
+        return name, None, "regal"
+
+    return name, None, "prospect"
 
 
-def build_prompt(payload: AnalyzeIn) -> str:
+def enrich_transcript(transcript: str):
+
+    enriched_lines = []
+
+    for line in transcript.splitlines():
+
+        speaker, email, speaker_type = parse_speaker(line)
+
+        if not speaker:
+            enriched_lines.append(line)
+            continue
+
+        prefix = f"{speaker_type.upper()}[{speaker}]"
+        enriched_lines.append(f"{prefix}: {line.split(':',1)[1].strip()}")
+
+    return "\n".join(enriched_lines)
+
+
+# =========================
+# PROMPT
+# =========================
+
+def build_prompt(call_id, transcript):
+
     return f"""
-You are an information extraction engine. You must output VALID JSON ONLY (no markdown, no commentary).
-Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript.
-If you cannot find a verbatim quote supporting an item, omit that item.
-Do not infer. Do not guess. Do not fabricate names, integrations, compliance requirements, numbers, or outcomes.
-Return empty arrays when nothing is found.
+You are an information extraction engine.
 
-Extract structured buyer questions, objections, product feedback moments, and buying signals from this call transcript.
+Only extract statements spoken by PROSPECT speakers.
+Ignore REGAL speakers.
 
-Return JSON with this schema:
+Return VALID JSON ONLY.
+
+Transcript:
+{transcript}
+
+Return schema:
 
 {{
-  "call_id": "{payload.clari_call_id or ""}",
-  "questions": [
-    {{
-      "verbatim": "",
-      "speaker": "",
-      "speaker_company": "",
-      "speaker_type": "prospect|rep|unknown",
-      "normalized": "",
-      "category": "integration|security|pricing|implementation|product|roi|timeline|other",
-      "tags": ["..."],
-      "evidence_quote": "",
-      "confidence": 0.0
-    }}
-  ],
-  "objections": [
-    {{
-      "verbatim": "",
-      "speaker": "",
-      "speaker_company": "",
-      "speaker_type": "prospect|rep|unknown",
-      "category": "integration|security|pricing|implementation|product|roi|timeline|other",
-      "evidence_quote": "",
-      "confidence": 0.0
-    }}
-  ],
-  "product_feedback": [
-    {{
-      "type": "feature_request|bug|confusion|missing_capability|competitor_comparison|implementation_friction",
-      "verbatim": "",
-      "speaker": "",
-      "speaker_company": "",
-      "speaker_type": "prospect|rep|unknown",
-      "evidence_quote": ""
-    }}
-  ],
-  "buying_signals": [
-    {{
-      "type": "exec_sponsorship|clear_success_criteria|urgency|strong_value_alignment|procurement_motion|next_steps_committed",
-      "verbatim": "",
-      "speaker": "",
-      "speaker_company": "",
-      "speaker_type": "prospect|rep|unknown",
-      "evidence_quote": "",
-      "confidence": 0.0
-    }}
-  ],
-  "summary_10_lines": ["..."],
-  "topic_tags": ["..."],
-  "quality_flags": {{
-    "transcript_too_short": false,
-    "low_signal": false
-  }}
+ "call_id":"{call_id}",
+ "questions":[],
+ "objections":[],
+ "product_feedback":[],
+ "buying_signals":[],
+ "summary_10_lines":[],
+ "topic_tags":[],
+ "quality_flags":{{
+   "transcript_too_short":false,
+   "low_signal":false
+ }}
 }}
-
-Rules:
-- Output JSON only.
-- Keep verbatim fields short (<= 240 chars).
-- "normalized" should be reusable as a FAQ/blog title.
-- "tags" should include specific systems/terms if present (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
-- Do not add creative content.
-
-Speaker Attribution Rules:
-- Transcripts contain speaker identifiers formatted like "email@company.com:"
-- Extract the speaker EXACTLY as written before the colon for each item’s evidence_quote.
-- speaker_company should be the email domain.
-- speaker_type should be "rep" if domain contains regalvoice.com, regal.ai, or regal.io, otherwise "prospect".
-- Never infer speakers.
-- Prefer prospect-spoken items when possible.
-
-Inputs:
-clari_call_id: {payload.clari_call_id or ""}
-salesforce_opp_id: {payload.salesforce_opp_id or ""}
-stage_at_time: {payload.stage_at_time or ""}
-segment: {payload.segment or ""}
-
-transcript:
-{payload.transcript}
 """.strip()
 
 
-def call_claude(prompt: str) -> dict:
-    """
-    Calls Anthropic Messages API and returns parsed JSON.
-    Includes defensive error reporting (status + body) and robust JSON extraction fallback.
-    """
+# =========================
+# CLAUDE CALL
+# =========================
+
+def call_claude(prompt):
+
     url = "https://api.anthropic.com/v1/messages"
+
     headers = {
         "x-api-key": CLAUDE_API_KEY,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+
     body = {
         "model": CLAUDE_MODEL,
         "max_tokens": 3000,
@@ -171,47 +160,17 @@ def call_claude(prompt: str) -> dict:
 
     r = requests.post(url, headers=headers, json=body, timeout=120)
 
-    # Provide the actual Anthropic error body so debugging is instant (invalid key/model/etc.)
-    if r.status_code >= 400:
-        raise ValueError(f"Anthropic error {r.status_code}: {r.text[:2000]}")
+    if r.status_code != 200:
+        raise Exception(f"Anthropic error {r.status_code}: {r.text}")
 
-    data = r.json()
+    content = r.json()["content"][0]["text"]
 
-    # Messages API returns content blocks; concatenate text blocks
-    content_blocks = data.get("content", []) or []
-    text_parts: list[str] = []
-    for b in content_blocks:
-        if isinstance(b, dict) and b.get("type") == "text" and "text" in b:
-            text_parts.append(b["text"])
+    return json.loads(content)
 
-    raw_text = "".join(text_parts).strip()
-    if not raw_text:
-        raise ValueError(f"Claude response missing text content: {json.dumps(data)[:2000]}")
 
-    # Strict parse first
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        # Fallback: extract the first JSON object/array from the response
-        start_obj = raw_text.find("{")
-        start_arr = raw_text.find("[")
-        starts = [i for i in (start_obj, start_arr) if i != -1]
-        if not starts:
-            raise ValueError(f"Claude returned non-JSON text (first 500 chars): {raw_text[:500]}")
-
-        start = min(starts)
-        trimmed = raw_text[start:].strip()
-
-        # Attempt to trim trailing junk by finding the last closing brace/bracket
-        end_obj = trimmed.rfind("}")
-        end_arr = trimmed.rfind("]")
-        end = max(end_obj, end_arr)
-        if end == -1:
-            raise ValueError(f"Claude returned incomplete JSON (first 500 chars): {trimmed[:500]}")
-
-        candidate = trimmed[: end + 1]
-        return json.loads(candidate)
-
+# =========================
+# ROUTES
+# =========================
 
 @app.get("/health")
 def health():
@@ -220,125 +179,44 @@ def health():
 
 @app.post("/analyze")
 def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)):
-    # Optional shared-secret gate
+
     if AUTH_TOKEN:
-        expected = f"bearer {AUTH_TOKEN}".strip().lower()
-        got = (authorization or "").strip().lower()
-        if got != expected:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        if authorization != f"Bearer {AUTH_TOKEN}":
+            raise HTTPException(status_code=401)
 
-    transcript = payload.transcript or ""
-    is_too_short = len(transcript) < 400
+    transcript = payload.transcript
 
-    # Short transcript guard (keeps costs low and avoids low-signal junk)
-    if is_too_short:
-        base = {
-            "call_id": payload.clari_call_id or "",
-            "questions": [],
-            "objections": [],
-            "product_feedback": [],
-            "buying_signals": [],
-            "summary_10_lines": [],
-            "topic_tags": [],
-            "quality_flags": {"transcript_too_short": True, "low_signal": True},
-        }
+    if len(transcript) < 400:
         return {
             "analysis_status": "processed",
             "analysis_error": "",
             "analysis_last_run_at": now_iso(),
-            "extraction_json": json.dumps(base),
-            "questions_json": json.dumps([]),
-            "objections_json": json.dumps([]),
-            "product_feedback_json": json.dumps([]),
-            "buying_signals_json": json.dumps([]),
-            "topic_tags": [],
-            "top_questions_bullets": "",
-            "evidence_quotes_json": json.dumps([]),
+            "extraction_json": "{}",
         }
 
     try:
-        prompt = build_prompt(payload)
+
+        enriched = enrich_transcript(transcript)
+
+        prompt = build_prompt(
+            payload.clari_call_id or "",
+            enriched
+        )
+
         result = call_claude(prompt)
-
-        # Enforce quality flags deterministically (don't let the model set these incorrectly)
-        qf = (result.get("quality_flags") or {})
-        qf["transcript_too_short"] = is_too_short
-        qf["low_signal"] = bool(qf.get("low_signal", False))
-        result["quality_flags"] = qf
-
-        def normalize_and_filter(items):
-            cleaned = []
-            for item in items or []:
-                if not isinstance(item, dict):
-                    continue
-
-                speaker = item.get("speaker") or ""
-                speaker_type, company = classify_speaker(speaker)
-
-                item["speaker_type"] = item.get("speaker_type") or speaker_type
-                item["speaker_company"] = item.get("speaker_company") or company
-
-                # Suppress internal Regal speakers
-                if speaker_type == "rep":
-                    continue
-
-                cleaned.append(item)
-            return cleaned
-
-        questions = normalize_and_filter(result.get("questions", []) or [])
-        objections = normalize_and_filter(result.get("objections", []) or [])
-        product_feedback = normalize_and_filter(result.get("product_feedback", []) or [])
-        buying_signals = normalize_and_filter(result.get("buying_signals", []) or [])
-
-        # Replace with filtered versions so extraction_json is buyer-only too
-        result["questions"] = questions
-        result["objections"] = objections
-        result["product_feedback"] = product_feedback
-        result["buying_signals"] = buying_signals
-
-        topic_tags = result.get("topic_tags", []) or []
-
-        # Gather a compact set of receipts for quick human validation
-        evidence_quotes: list[str] = []
-        for q in questions[:25]:
-            if q.get("evidence_quote"):
-                evidence_quotes.append(q["evidence_quote"])
-        for o in objections[:25]:
-            if o.get("evidence_quote"):
-                evidence_quotes.append(o["evidence_quote"])
-
-        # Friendly bullets for quick scanning
-        top_bullets: list[str] = []
-        for q in questions[:7]:
-            norm = q.get("normalized") or q.get("verbatim")
-            if norm:
-                top_bullets.append(f"- {norm}")
 
         return {
             "analysis_status": "processed",
             "analysis_error": "",
             "analysis_last_run_at": now_iso(),
             "extraction_json": json.dumps(result),
-            "questions_json": json.dumps(questions),
-            "objections_json": json.dumps(objections),
-            "product_feedback_json": json.dumps(product_feedback),
-            "buying_signals_json": json.dumps(buying_signals),
-            "topic_tags": topic_tags,
-            "top_questions_bullets": "\n".join(top_bullets),
-            "evidence_quotes_json": json.dumps(evidence_quotes[:25]),
         }
 
     except Exception as e:
+
         return {
             "analysis_status": "error",
-            "analysis_error": str(e)[:4000],
+            "analysis_error": str(e),
             "analysis_last_run_at": now_iso(),
             "extraction_json": "",
-            "questions_json": json.dumps([]),
-            "objections_json": json.dumps([]),
-            "product_feedback_json": json.dumps([]),
-            "buying_signals_json": json.dumps([]),
-            "topic_tags": [],
-            "top_questions_bullets": "",
-            "evidence_quotes_json": json.dumps([]),
         }
