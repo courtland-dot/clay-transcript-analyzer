@@ -45,7 +45,7 @@ class AnalyzeIn(BaseModel):
 # =========================
 # HELPERS
 # =========================
-EMAIL_REGEX = re.compile(r'([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})', re.IGNORECASE)
+EMAIL_REGEX = re.compile(r"([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", re.IGNORECASE)
 
 
 def now_iso() -> str:
@@ -109,10 +109,14 @@ def normalize_speaker_fields(display: Optional[str], email: Optional[str], compa
     email = _clean(email) or ""
     company_domain = _clean(company_domain) or "unknown"
 
+    # FIX #2: normalize display casing for name-like strings
+    if display != "Unknown" and "@" not in display and len(display.split()) <= 4:
+        display = " ".join([w.capitalize() for w in display.split()])
+
     is_regal = classify_regal(display if display != "Unknown" else None, email if email else None)
     speaker_type = "regal" if is_regal else "prospect"
 
-    # If email is present and domain is a Regal domain, suppress company label to avoid leaking internal domains
+    # If speaker is Regal, do not leak internal domains as "company"
     speaker_company = company_domain
     if speaker_type == "regal":
         speaker_company = "Regal"
@@ -313,7 +317,6 @@ def call_claude(prompt: str) -> Dict[str, Any]:
 
     r = requests.post(url, headers=headers, json=body, timeout=120)
     if r.status_code >= 400:
-        # keep this concise for Clay mapping
         raise Exception(f"Anthropic error {r.status_code}: {r.text[:2000]}")
 
     data = r.json()
@@ -323,6 +326,23 @@ def call_claude(prompt: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("Claude returned JSON but not an object")
     return parsed
+
+
+# =========================
+# TAG SUPPORT FILTER (Fix #3)
+# =========================
+def _tag_supported(tag: str, transcript: str) -> bool:
+    """
+    Prevent inferred tags (e.g., "pricing") unless explicitly supported in the raw transcript.
+    """
+    t = (transcript or "").lower()
+    tag_l = (tag or "").strip().lower()
+    if not tag_l:
+        return False
+
+    if tag_l == "pricing":
+        return any(k in t for k in ["pricing", "price", "cost", "$"])
+    return True
 
 
 # =========================
@@ -378,6 +398,16 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
         product_feedback = result.get("product_feedback", []) or []
         buying_signals = result.get("buying_signals", []) or []
         topic_tags = result.get("topic_tags", []) or []
+
+        # FIX #1: override quality flags deterministically
+        qf = result.get("quality_flags") or {}
+        qf["transcript_too_short"] = (len(transcript) < 400)
+        qf["low_signal"] = (not questions and not objections and not buying_signals and not product_feedback)
+        result["quality_flags"] = qf
+
+        # FIX #3: filter unsupported inferred tags
+        topic_tags = [t for t in topic_tags if _tag_supported(t, transcript)]
+        result["topic_tags"] = topic_tags
 
         # Evidence quotes quick list (Clay-friendly)
         evidence_quotes: List[str] = []
