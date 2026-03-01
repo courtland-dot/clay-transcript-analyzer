@@ -133,9 +133,18 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
     """
     Rewrite each speaker line to a consistent format that helps the model:
       SPEAKER[prospect|regal] display=<...> email=<...> company=<...>: utterance...
-    Non-speaker lines pass through unchanged.
+
+    Enhancements:
+    - Speaker identity memory within a single transcript:
+        If we see "Patrice" with an email once, later "Patrice:" lines inherit that email/company.
+    - Keeps original utterance unchanged.
+    - Non-speaker lines pass through unchanged.
     """
     out_lines: List[str] = []
+
+    # In-transcript identity memory: display(lower) -> (email, domain)
+    speaker_memory: Dict[str, Tuple[str, str]] = {}
+
     for raw_line in transcript.splitlines():
         line = raw_line.rstrip("\n")
         display, email, dom = parse_speaker_header(line)
@@ -144,12 +153,27 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
             continue
 
         utterance = line.split(":", 1)[1].strip()
+
+        key = (display or "").strip().lower()
+
+        # If this line includes an email, remember it for this speaker display
+        if email:
+            speaker_memory[key] = (email, dom or "")
+
+        # If this line has no email, but we've seen this speaker before, inherit it
+        elif key in speaker_memory:
+            remembered_email, remembered_dom = speaker_memory[key]
+            email = remembered_email
+            dom = dom or remembered_dom
+
         meta = normalize_speaker_fields(display, email, dom)
 
         # Use a stable, parseable marker; keep the original utterance unchanged
         out_lines.append(
-            f"SPEAKER[{meta['speaker_type']}] display={meta['speaker_display']} email={meta['speaker_email']} company={meta['speaker_company']}: {utterance}"
+            f"SPEAKER[{meta['speaker_type']}] display={meta['speaker_display']} "
+            f"email={meta['speaker_email']} company={meta['speaker_company']}: {utterance}"
         )
+
     return "\n".join(out_lines)
 
 
