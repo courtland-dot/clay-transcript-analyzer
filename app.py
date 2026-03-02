@@ -2,7 +2,7 @@ import os
 import json
 import re
 from datetime import datetime, timezone
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Header
@@ -28,7 +28,7 @@ REGAL_DOMAINS = set(
 )
 
 # Optional: pipe-separated list of employee full names for internal speaker detection
-# e.g. "Alex Krumm|Maaria Khalid|Courtland Nicholas"
+# e.g. "Alex Catalisan|Maaria Khalid|Courtland Nicholas"
 EMPLOYEE_NAMES: List[str] = [
     n.strip() for n in os.environ.get("REGAL_EMPLOYEE_NAMES", "").split("|") if n.strip()
 ]
@@ -187,7 +187,6 @@ def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, st
     dom = (dom or "").strip().lower()
 
     regal = is_regal_speaker(display, email, dom)
-
     speaker_type = "regal" if regal else "prospect"
 
     # Display preference:
@@ -239,7 +238,6 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
             out_lines.append(raw_line)
             continue
 
-        # Extract utterance safely
         parts = line.split(":", 1)
         if len(parts) < 2:
             out_lines.append(raw_line)
@@ -260,7 +258,6 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
 
         meta = normalize_speaker_fields(display, email, dom)
 
-        # Use a stable, parseable marker; keep the original utterance unchanged
         out_lines.append(
             f"SPEAKER[{meta['speaker_type']}] display={meta['speaker_display']} "
             f"email={meta['speaker_email']} company={meta['speaker_company']}: {utterance}"
@@ -273,28 +270,37 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
 # Prompting
 # ----------------------------
 def build_prompt(payload: AnalyzeIn) -> str:
+    """
+    Updated schema:
+    - summary_10_lines is now a list of objects: {line, evidence_quote}
+    - topic_tags must be grounded and each must have evidence in topic_tag_evidence
+    """
+    call_id = payload.clari_call_id or ""
+    sf_opp_id = payload.salesforce_opp_id or ""
+    stage = payload.stage_at_time or ""
+    segment = payload.segment or ""
+
     enriched = enrich_transcript_for_attribution(payload.transcript)
 
     return f"""
-You are an information extraction engine. You must output VALID JSON ONLY (no markdown, no commentary).
+You are an information extraction engine. You must output VALID JSON ONLY (no markdown, no backticks, no commentary).
+Only extract items from lines labeled SPEAKER[prospect]. Ignore SPEAKER[regal] lines entirely.
 
-CRITICAL CREDIBILITY RULES:
-- Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript provided (including the SPEAKER[...] prefix).
-- If you cannot find a verbatim quote supporting an item, omit that item. Do not infer.
-- Do not fabricate names, integrations, compliance requirements, numbers, timelines, outcomes, or next steps.
+HARD EVIDENCE RULES (NO EXCEPTIONS):
+- Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript.
+- The evidence_quote MUST include the SPEAKER[prospect] prefix line content verbatim as it appears.
+- If you cannot find a verbatim quote supporting an item, OMIT the item.
+- Do not infer. Do not guess. Do not fabricate names, integrations, compliance requirements, numbers, timelines, outcomes, sentiment, or next-step commitments.
 
-SPEAKER RULES:
-- Only extract items spoken by SPEAKER[prospect]. Ignore SPEAKER[regal].
-- Copy speaker fields exactly from the transcript prefix:
-  - speaker_display
-  - speaker_email
-  - speaker_company
-  - speaker_type ("prospect" always for extracted items)
+NORMALIZATION RULES:
+- You may normalize ONLY in: normalized, tags, topic_tags
+- NEVER normalize inside evidence_quote (evidence_quote must be copied verbatim from transcript).
+- Example: transcript says "five nights" -> you MAY tag "five9", but evidence_quote must still show "five nights".
 
-Return JSON with this schema (object at top-level):
+Return JSON with this schema (VALID JSON ONLY):
 
 {{
-  "call_id": "{payload.clari_call_id or ""}",
+  "call_id": "{call_id}",
   "questions": [
     {{
       "verbatim": "",
@@ -344,26 +350,50 @@ Return JSON with this schema (object at top-level):
       "confidence": 0.0
     }}
   ],
-  "summary_10_lines": ["..."],
+
+  "summary_10_lines": [
+    {{
+      "line": "",
+      "evidence_quote": ""
+    }}
+  ],
+
   "topic_tags": ["..."],
+  "topic_tag_evidence": [
+    {{
+      "topic_tag": "",
+      "evidence_quote": ""
+    }}
+  ],
+
   "quality_flags": {{
     "transcript_too_short": false,
     "low_signal": false
   }}
 }}
 
-Rules:
+RULES:
 - Output JSON only.
 - Keep verbatim fields short (<= 240 chars).
 - "normalized" should be reusable as a FAQ/blog title.
-- "tags" should include specific systems/terms if present in the prospect's words (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
-- topic_tags should be grounded in the transcript, not guessed.
+- "tags" should include specific systems/terms if present (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
+- Confidence is 0.0 to 1.0 and should be conservative.
+
+SUMMARY REQUIREMENTS:
+- Each summary line MUST be grounded with evidence_quote that is an exact substring (including SPEAKER[prospect] prefix).
+- Do NOT mention any fact in summary that does not appear verbatim in transcript.
+- If fewer than 10 grounded lines exist, return fewer lines (0-10).
+
+TOPIC TAG REQUIREMENTS:
+- Each topic_tag MUST have at least one corresponding entry in topic_tag_evidence.
+- If you cannot provide evidence for a topic_tag, do not include that tag.
+- Keep topic_tags stable, lowercase, snake_case.
 
 Inputs:
-clari_call_id: {payload.clari_call_id or ""}
-salesforce_opp_id: {payload.salesforce_opp_id or ""}
-stage_at_time: {payload.stage_at_time or ""}
-segment: {payload.segment or ""}
+clari_call_id: {call_id}
+salesforce_opp_id: {sf_opp_id}
+stage_at_time: {stage}
+segment: {segment}
 
 transcript (with SPEAKER prefixes):
 {enriched}
@@ -389,7 +419,6 @@ def call_claude(prompt: str) -> Tuple[dict, str]:
 
     r = requests.post(url, headers=headers, data=json.dumps(body), timeout=120)
 
-    # Better error propagation
     if r.status_code >= 400:
         try:
             err = r.json()
@@ -400,10 +429,8 @@ def call_claude(prompt: str) -> Tuple[dict, str]:
     data = r.json()
     content = data.get("content", [])
 
-    # Anthropic returns a list of blocks like [{"type":"text","text":"..."}]
     raw_text = ""
     if isinstance(content, list) and content:
-        # Join any text blocks
         parts = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
@@ -415,6 +442,51 @@ def call_claude(prompt: str) -> Tuple[dict, str]:
 
     json_text = extract_first_json_object(raw_text)
     return json.loads(json_text), raw_text
+
+
+# ----------------------------
+# Helpers for post-processing new schema
+# ----------------------------
+def coerce_summary_lines(summary_val) -> Tuple[List[str], List[str]]:
+    """
+    Supports:
+    - new: [{"line": "...", "evidence_quote": "SPEAKER[prospect] ..."}]
+    - old: ["..."]
+    Returns (lines, evidence_quotes)
+    """
+    lines: List[str] = []
+    evs: List[str] = []
+
+    if isinstance(summary_val, list):
+        for item in summary_val:
+            if isinstance(item, dict):
+                line = (item.get("line") or "").strip()
+                ev = (item.get("evidence_quote") or "").strip()
+                if line:
+                    lines.append(line)
+                if ev:
+                    evs.append(ev)
+            elif isinstance(item, str):
+                s = item.strip()
+                if s:
+                    lines.append(s)
+
+    return lines, evs
+
+
+def coerce_topic_tag_evidence(val) -> List[str]:
+    """
+    Expected: [{"topic_tag": "...", "evidence_quote": "..."}]
+    Returns evidence_quote list (strings)
+    """
+    evs: List[str] = []
+    if isinstance(val, list):
+        for item in val:
+            if isinstance(item, dict):
+                ev = (item.get("evidence_quote") or "").strip()
+                if ev:
+                    evs.append(ev)
+    return evs
 
 
 # ----------------------------
@@ -442,6 +514,7 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "buying_signals": [],
             "summary_10_lines": [],
             "topic_tags": [],
+            "topic_tag_evidence": [],
             "quality_flags": {"transcript_too_short": True, "low_signal": True},
         }
         return {
@@ -456,6 +529,9 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "topic_tags": [],
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
+            # Optional additional flat fields (safe for Clay mapping later)
+            "summary_lines_json": json.dumps([]),
+            "topic_tag_evidence_json": json.dumps([]),
         }
 
     raw_text = ""
@@ -469,13 +545,24 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
         buying_signals = result.get("buying_signals", []) or []
         topic_tags = result.get("topic_tags", []) or []
 
-        evidence_quotes = []
+        summary_lines, summary_evidence = coerce_summary_lines(result.get("summary_10_lines", []))
+        topic_tag_evidence_quotes = coerce_topic_tag_evidence(result.get("topic_tag_evidence", []))
+
+        evidence_quotes: List[str] = []
+
+        # Pull evidence from questions/objections
         for q in questions[:25]:
-            if q.get("evidence_quote"):
-                evidence_quotes.append(q["evidence_quote"])
+            ev = q.get("evidence_quote")
+            if ev:
+                evidence_quotes.append(ev)
         for o in objections[:25]:
-            if o.get("evidence_quote"):
-                evidence_quotes.append(o["evidence_quote"])
+            ev = o.get("evidence_quote")
+            if ev:
+                evidence_quotes.append(ev)
+
+        # Add evidence from summary and topic tags (new schema)
+        evidence_quotes.extend(summary_evidence[:25])
+        evidence_quotes.extend(topic_tag_evidence_quotes[:25])
 
         # Dedupe evidence quotes while preserving order
         seen = set()
@@ -503,10 +590,12 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "topic_tags": topic_tags,
             "top_questions_bullets": "\n".join(top_bullets),
             "evidence_quotes_json": json.dumps(deduped_quotes[:25]),
+            # Optional additional flat fields (nice for Clay column mapping)
+            "summary_lines_json": json.dumps(summary_lines),
+            "topic_tag_evidence_json": json.dumps(topic_tag_evidence_quotes),
         }
 
     except Exception as e:
-        # Return error fields in a way Clay can map + include debug_model_output
         return {
             "analysis_status": "error",
             "analysis_error": str(e)[:4000],
@@ -519,5 +608,7 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "topic_tags": [],
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
+            "summary_lines_json": json.dumps([]),
+            "topic_tag_evidence_json": json.dumps([]),
             "debug_model_output": (raw_text[:4000] if raw_text else ""),
         }
