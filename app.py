@@ -2,7 +2,7 @@ import os
 import json
 import re
 from datetime import datetime, timezone
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, Header
@@ -25,6 +25,11 @@ EMPLOYEE_NAMES: List[str] = [
     n.strip() for n in os.environ.get("REGAL_EMPLOYEE_NAMES", "").split("|") if n.strip()
 ]
 EMPLOYEE_NAMES_LOWER = {n.lower() for n in EMPLOYEE_NAMES}
+
+# Tuneable knobs
+CLAUDE_TIMEOUT_SEC = int(os.environ.get("CLAUDE_TIMEOUT_SEC", "120"))
+CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "4000"))  # per-call
+# If you still see truncation, raise to 6000; multi-call should prevent it anyway.
 
 app = FastAPI()
 
@@ -62,19 +67,39 @@ def looks_like_email(s: str) -> bool:
     s = (s or "").strip()
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s))
 
-def extract_first_json_object(text: str) -> str:
+def extract_first_json_value(text: str) -> str:
     """
-    Extract the first top-level JSON object from a string.
-    Raises ValueError if the object is incomplete (common when model output truncates).
+    Extract first top-level JSON value (object or array) from a string.
+    Handles extra text around it. Raises ValueError if incomplete/truncated.
     """
     s = (text or "").strip()
+    if not s:
+        raise ValueError("Empty model output")
 
-    if s.startswith("{") and s.endswith("}"):
+    # fast paths
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
         return s
 
-    start = s.find("{")
-    if start == -1:
-        raise ValueError("No JSON object start '{' found in model output")
+    # find first { or [
+    start_obj = s.find("{")
+    start_arr = s.find("[")
+    if start_obj == -1 and start_arr == -1:
+        raise ValueError("No JSON start '{' or '[' found in model output")
+
+    if start_obj == -1:
+        start = start_arr
+        open_ch, close_ch = "[", "]"
+    elif start_arr == -1:
+        start = start_obj
+        open_ch, close_ch = "{", "}"
+    else:
+        # earliest
+        if start_obj < start_arr:
+            start = start_obj
+            open_ch, close_ch = "{", "}"
+        else:
+            start = start_arr
+            open_ch, close_ch = "[", "]"
 
     depth = 0
     in_str = False
@@ -92,14 +117,17 @@ def extract_first_json_object(text: str) -> str:
         else:
             if ch == '"':
                 in_str = True
-            elif ch == "{":
+            elif ch == open_ch:
                 depth += 1
-            elif ch == "}":
+            elif ch == close_ch:
                 depth -= 1
                 if depth == 0:
                     return s[start : i + 1]
 
-    raise ValueError("Could not find a complete JSON object in model output")
+            # allow nested other bracket types without counting them
+            # (JSON guarantees balanced overall; we only track the first type)
+
+    raise ValueError("Could not find a complete JSON value in model output (likely truncated)")
 
 # ----------------------------
 # Speaker parsing + normalization
@@ -107,17 +135,14 @@ def extract_first_json_object(text: str) -> str:
 def parse_speaker_header(line: str) -> Tuple[str, str, str]:
     if ":" not in line:
         return "", "", ""
-
     left = line.split(":", 1)[0].strip()
     if not left:
         return "", "", ""
-
     if looks_like_email(left):
         email = left
         dom = domain_from_email(email)
         display = display_from_email(email) or email
         return display, email, dom
-
     return left, "", ""
 
 def is_regal_speaker(display: str, email: str, dom: str) -> bool:
@@ -138,14 +163,17 @@ def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, st
     regal = is_regal_speaker(display, email, dom)
     speaker_type = "regal" if regal else "prospect"
 
+    # Display label
     if looks_like_email(display):
         pretty = display_from_email(display)
         speaker_display = pretty or display
     else:
         speaker_display = display or (display_from_email(email) if email else "Unknown")
 
+    # suppress internal email
     speaker_email = "" if regal else (email or "")
 
+    # prospect company derived from email domain if known
     speaker_company = "unknown"
     if not regal:
         if dom:
@@ -162,16 +190,18 @@ def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, st
 
 def enrich_transcript_for_attribution(transcript: str) -> str:
     """
-    Adds consistent SPEAKER[...] prefix lines and remembers prospect identity
-    within a single transcript (name -> email/domain).
+    Rewrite each speaker line to:
+      SPEAKER[prospect|regal] display=<...> email=<...> company=<...>: utterance...
+
+    Adds in-transcript identity memory: if we see a name with an email once,
+    later lines with just the name inherit that email/company.
     """
     out_lines: List[str] = []
-    speaker_memory: Dict[str, Tuple[str, str]] = {}  # display(lower) -> (email, domain)
+    speaker_memory: Dict[str, Tuple[str, str]] = {}  # display(lower) -> (email, dom)
 
     for raw_line in (transcript or "").splitlines():
         line = raw_line.rstrip("\n")
         display, email, dom = parse_speaker_header(line)
-
         if not display:
             out_lines.append(raw_line)
             continue
@@ -184,10 +214,8 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
 
         key = display.strip().lower()
 
-        # remember email/domain when present
         if email:
             speaker_memory[key] = (email, dom or "")
-        # inherit if missing
         elif key in speaker_memory:
             remembered_email, remembered_dom = speaker_memory[key]
             email = remembered_email
@@ -203,90 +231,9 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
     return "\n".join(out_lines)
 
 # ----------------------------
-# Prompting (smaller + retry-friendly)
+# Anthropic call (raw)
 # ----------------------------
-def build_prompt(payload: AnalyzeIn, enriched_transcript: str, retry_small: bool = False) -> str:
-    call_id = payload.clari_call_id or ""
-    sf_opp_id = payload.salesforce_opp_id or ""
-    stage = payload.stage_at_time or ""
-    segment = payload.segment or ""
-
-    # tighter limits on retry to prevent truncation
-    if retry_small:
-        limits = {
-            "questions": 6,
-            "objections": 6,
-            "product_feedback": 6,
-            "buying_signals": 6,
-            "summary_lines": 6,
-            "topic_tags": 10,
-            "topic_tag_evidence": 12,
-            "evidence_quote_chars": 220,
-        }
-    else:
-        limits = {
-            "questions": 12,
-            "objections": 12,
-            "product_feedback": 12,
-            "buying_signals": 12,
-            "summary_lines": 10,
-            "topic_tags": 15,
-            "topic_tag_evidence": 25,
-            "evidence_quote_chars": 320,
-        }
-
-    return f"""
-Return ONLY one valid JSON object. No markdown. No backticks. No extra text.
-Only extract items from lines labeled SPEAKER[prospect]. Ignore SPEAKER[regal] completely.
-
-Hard evidence rules:
-- Every extracted item MUST include evidence_quote that is an exact, verbatim substring from the transcript.
-- evidence_quote MUST include the SPEAKER[prospect] prefix exactly as shown in the transcript.
-- If you cannot support an item with an exact quote, OMIT it. Do not infer or guess.
-
-Output size limits (must obey):
-- questions max {limits["questions"]}
-- objections max {limits["objections"]}
-- product_feedback max {limits["product_feedback"]}
-- buying_signals max {limits["buying_signals"]}
-- summary_10_lines max {limits["summary_lines"]} (each line must include evidence_quote)
-- topic_tags max {limits["topic_tags"]}
-- topic_tag_evidence max {limits["topic_tag_evidence"]}
-- Each evidence_quote must be <= {limits["evidence_quote_chars"]} chars (truncate the quote if longer, but keep it verbatim substring).
-
-Required JSON schema (keys must exist; arrays can be empty):
-{{
-  "call_id": "{call_id}",
-  "questions": [{{"verbatim":"","speaker_display":"","speaker_email":"","speaker_company":"","speaker_type":"prospect","normalized":"","category":"integration|security|pricing|implementation|product|roi|timeline|other","tags":[],"evidence_quote":"","confidence":0.0}}],
-  "objections": [{{"verbatim":"","speaker_display":"","speaker_email":"","speaker_company":"","speaker_type":"prospect","category":"integration|security|pricing|implementation|product|roi|timeline|other","evidence_quote":"","confidence":0.0}}],
-  "product_feedback": [{{"type":"feature_request|bug|confusion|missing_capability|competitor_comparison|implementation_friction","verbatim":"","speaker_display":"","speaker_email":"","speaker_company":"","speaker_type":"prospect","evidence_quote":""}}],
-  "buying_signals": [{{"type":"exec_sponsorship|clear_success_criteria|urgency|strong_value_alignment|procurement_motion|next_steps_committed","verbatim":"","speaker_display":"","speaker_email":"","speaker_company":"","speaker_type":"prospect","evidence_quote":"","confidence":0.0}}],
-  "summary_10_lines": [{{"line":"","evidence_quote":""}}],
-  "topic_tags": [],
-  "topic_tag_evidence": [{{"topic_tag":"","evidence_quote":""}}],
-  "quality_flags": {{"transcript_too_short": false, "low_signal": false}}
-}}
-
-Other rules:
-- confidence 0.0–1.0 conservative
-- normalized should be reusable as FAQ/blog title
-- tags/topic_tags must be grounded in the transcript (no guessing)
-- topic_tags must be lowercase snake_case
-
-Inputs:
-clari_call_id: {call_id}
-salesforce_opp_id: {sf_opp_id}
-stage_at_time: {stage}
-segment: {segment}
-
-transcript:
-{enriched_transcript}
-""".strip()
-
-# ----------------------------
-# Anthropic call (RAW TEXT ONLY)
-# ----------------------------
-def call_claude_raw(prompt: str, max_tokens: int = 8000) -> str:
+def call_claude_raw(prompt: str, max_tokens: int) -> str:
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": CLAUDE_API_KEY,
@@ -297,11 +244,10 @@ def call_claude_raw(prompt: str, max_tokens: int = 8000) -> str:
         "model": CLAUDE_MODEL,
         "max_tokens": max_tokens,
         "temperature": 0,
-        "system": "Return only a single valid JSON object. Do not include any other text.",
+        "system": "Return ONLY valid JSON. No extra text.",
         "messages": [{"role": "user", "content": prompt}],
     }
-
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=120)
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=CLAUDE_TIMEOUT_SEC)
 
     if r.status_code >= 400:
         try:
@@ -313,46 +259,158 @@ def call_claude_raw(prompt: str, max_tokens: int = 8000) -> str:
     data = r.json()
     content = data.get("content", [])
 
-    if not isinstance(content, list) or not content:
-        return ""
-
-    parts = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
-            parts.append(block["text"])
+    parts: List[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
+                parts.append(block["text"])
 
     return "\n".join(parts).strip()
 
-# ----------------------------
-# Post-processing helpers
-# ----------------------------
-def coerce_summary_lines(summary_val):
-    lines: List[str] = []
-    evs: List[str] = []
-    if isinstance(summary_val, list):
-        for item in summary_val:
-            if isinstance(item, dict):
-                line = (item.get("line") or "").strip()
-                ev = (item.get("evidence_quote") or "").strip()
-                if line:
-                    lines.append(line)
-                if ev:
-                    evs.append(ev)
-            elif isinstance(item, str):
-                s = item.strip()
-                if s:
-                    lines.append(s)
-    return lines, evs
+def call_claude_json(prompt: str, max_tokens: int) -> Tuple[Any, str]:
+    raw = call_claude_raw(prompt, max_tokens=max_tokens)
+    json_text = extract_first_json_value(raw)
+    return json.loads(json_text), raw
 
-def coerce_topic_tag_evidence(val):
-    evs: List[str] = []
-    if isinstance(val, list):
-        for item in val:
-            if isinstance(item, dict):
-                ev = (item.get("evidence_quote") or "").strip()
-                if ev:
-                    evs.append(ev)
-    return evs
+# ----------------------------
+# Prompts (small, per-section)
+# ----------------------------
+def common_instructions(enriched_transcript: str) -> str:
+    return f"""
+Only extract from lines starting with SPEAKER[prospect]. Ignore SPEAKER[regal].
+
+Evidence rules:
+- Every item MUST include evidence_quote which is an exact, verbatim substring of the transcript.
+- evidence_quote MUST include the SPEAKER[prospect] prefix exactly as shown.
+- If you cannot support it with an exact quote, OMIT it (do not guess).
+
+Return JSON only. No markdown. No commentary.
+
+Transcript:
+{enriched_transcript}
+""".strip()
+
+def prompt_questions(enriched: str, limit: int = 10) -> str:
+    return f"""
+{common_instructions(enriched)}
+
+Return a JSON array of questions (max {limit}).
+Each item schema:
+{{
+  "verbatim": "",
+  "speaker_display": "",
+  "speaker_email": "",
+  "speaker_company": "",
+  "speaker_type": "prospect",
+  "normalized": "",
+  "category": "integration|security|pricing|implementation|product|roi|timeline|other",
+  "tags": [],
+  "evidence_quote": "",
+  "confidence": 0.0
+}}
+
+Constraints:
+- Keep verbatim <= 240 chars.
+- Keep evidence_quote <= 260 chars (truncate the quote if longer but keep it verbatim substring).
+""".strip()
+
+def prompt_objections(enriched: str, limit: int = 12) -> str:
+    return f"""
+{common_instructions(enriched)}
+
+Return a JSON array of objections/concerns (max {limit}).
+Each item schema:
+{{
+  "verbatim": "",
+  "speaker_display": "",
+  "speaker_email": "",
+  "speaker_company": "",
+  "speaker_type": "prospect",
+  "category": "integration|security|pricing|implementation|product|roi|timeline|other",
+  "evidence_quote": "",
+  "confidence": 0.0
+}}
+
+Constraints:
+- Keep verbatim <= 240 chars.
+- Keep evidence_quote <= 260 chars.
+""".strip()
+
+def prompt_product_feedback(enriched: str, limit: int = 10) -> str:
+    return f"""
+{common_instructions(enriched)}
+
+Return a JSON array of product feedback moments (max {limit}).
+Each item schema:
+{{
+  "type": "feature_request|bug|confusion|missing_capability|competitor_comparison|implementation_friction",
+  "verbatim": "",
+  "speaker_display": "",
+  "speaker_email": "",
+  "speaker_company": "",
+  "speaker_type": "prospect",
+  "evidence_quote": ""
+}}
+
+Constraints:
+- Keep verbatim <= 240 chars.
+- Keep evidence_quote <= 260 chars.
+""".strip()
+
+def prompt_buying_signals(enriched: str, limit: int = 10) -> str:
+    return f"""
+{common_instructions(enriched)}
+
+Return a JSON array of buying signals (max {limit}).
+Each item schema:
+{{
+  "type": "exec_sponsorship|clear_success_criteria|urgency|strong_value_alignment|procurement_motion|next_steps_committed",
+  "verbatim": "",
+  "speaker_display": "",
+  "speaker_email": "",
+  "speaker_company": "",
+  "speaker_type": "prospect",
+  "evidence_quote": "",
+  "confidence": 0.0
+}}
+
+Constraints:
+- Keep verbatim <= 240 chars.
+- Keep evidence_quote <= 260 chars.
+""".strip()
+
+def prompt_summary_and_tags(enriched: str) -> str:
+    return f"""
+{common_instructions(enriched)}
+
+Return ONE JSON object with:
+{{
+  "summary_10_lines": [{{"line":"","evidence_quote":""}}],
+  "topic_tags": [],
+  "topic_tag_evidence": [{{"topic_tag":"","evidence_quote":""}}],
+  "quality_flags": {{"transcript_too_short": false, "low_signal": false}}
+}}
+
+Rules:
+- summary_10_lines: max 10 items; each MUST have evidence_quote (<= 260 chars).
+- topic_tags: max 15; lowercase snake_case; must be grounded in transcript.
+- topic_tag_evidence: max 25; each evidence_quote <= 260 chars.
+""".strip()
+
+# ----------------------------
+# Helpers for response shaping
+# ----------------------------
+def safe_list(x) -> list:
+    return x if isinstance(x, list) else []
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for s in items:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 # ----------------------------
 # Routes
@@ -363,6 +421,7 @@ def health():
 
 @app.post("/analyze")
 def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)):
+    # Optional shared-secret gate
     if AUTH_TOKEN:
         if not authorization or authorization != f"Bearer {AUTH_TOKEN}":
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -389,87 +448,122 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "objections_json": json.dumps([]),
             "product_feedback_json": json.dumps([]),
             "buying_signals_json": json.dumps([]),
+            "summary_lines_json": json.dumps([]),
             "topic_tags": [],
+            "topic_tag_evidence_json": json.dumps([]),
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
-            "summary_lines_json": json.dumps([]),
-            "topic_tag_evidence_json": json.dumps([]),
             "debug_model_output": "",
         }
 
-    raw_text = ""
+    debug_blobs: List[str] = []
     try:
         enriched = enrich_transcript_for_attribution(transcript)
 
-        # Attempt 1 (normal)
-        prompt = build_prompt(payload, enriched, retry_small=False)
-        raw_text = call_claude_raw(prompt, max_tokens=8000)
+        # 1) Questions
+        questions, raw_q = call_claude_json(prompt_questions(enriched), max_tokens=CLAUDE_MAX_TOKENS)
+        debug_blobs.append(("questions:\n" + raw_q)[:1200])
 
-        if not raw_text:
-            raise ValueError("Claude returned empty text content")
+        # 2) Objections
+        objections, raw_o = call_claude_json(prompt_objections(enriched), max_tokens=CLAUDE_MAX_TOKENS)
+        debug_blobs.append(("objections:\n" + raw_o)[:1200])
 
-        try:
-            json_text = extract_first_json_object(raw_text)
-        except Exception:
-            # Attempt 2 (smaller output to avoid truncation)
-            retry_prompt = build_prompt(payload, enriched, retry_small=True)
-            raw_text = call_claude_raw(retry_prompt, max_tokens=8000)
-            if not raw_text:
-                raise ValueError("Claude returned empty text content (retry)")
-            json_text = extract_first_json_object(raw_text)
+        # 3) Product feedback
+        product_feedback, raw_pf = call_claude_json(prompt_product_feedback(enriched), max_tokens=CLAUDE_MAX_TOKENS)
+        debug_blobs.append(("product_feedback:\n" + raw_pf)[:1200])
 
-        result = json.loads(json_text)
+        # 4) Buying signals
+        buying_signals, raw_bs = call_claude_json(prompt_buying_signals(enriched), max_tokens=CLAUDE_MAX_TOKENS)
+        debug_blobs.append(("buying_signals:\n" + raw_bs)[:1200])
 
-        questions = result.get("questions", []) or []
-        objections = result.get("objections", []) or []
-        product_feedback = result.get("product_feedback", []) or []
-        buying_signals = result.get("buying_signals", []) or []
-        topic_tags = result.get("topic_tags", []) or []
+        # 5) Summary + tags
+        summary_pack, raw_sum = call_claude_json(prompt_summary_and_tags(enriched), max_tokens=CLAUDE_MAX_TOKENS)
+        debug_blobs.append(("summary_and_tags:\n" + raw_sum)[:1200])
 
-        summary_lines, summary_evidence = coerce_summary_lines(result.get("summary_10_lines", []))
-        topic_tag_evidence_quotes = coerce_topic_tag_evidence(result.get("topic_tag_evidence", []))
+        questions = safe_list(questions)
+        objections = safe_list(objections)
+        product_feedback = safe_list(product_feedback)
+        buying_signals = safe_list(buying_signals)
 
+        summary_lines_json: List[str] = []
+        summary_evidence: List[str] = []
+        topic_tags: List[str] = []
+        topic_tag_evidence_quotes: List[str] = []
+        quality_flags = {"transcript_too_short": False, "low_signal": False}
+
+        if isinstance(summary_pack, dict):
+            # summary lines as list of dicts
+            for item in safe_list(summary_pack.get("summary_10_lines", []))[:10]:
+                if isinstance(item, dict):
+                    line = (item.get("line") or "").strip()
+                    ev = (item.get("evidence_quote") or "").strip()
+                    if line:
+                        summary_lines_json.append(line)
+                    if ev:
+                        summary_evidence.append(ev)
+
+            topic_tags = [t for t in safe_list(summary_pack.get("topic_tags", [])) if isinstance(t, str)][:15]
+
+            for item in safe_list(summary_pack.get("topic_tag_evidence", []))[:25]:
+                if isinstance(item, dict):
+                    ev = (item.get("evidence_quote") or "").strip()
+                    if ev:
+                        topic_tag_evidence_quotes.append(ev)
+
+            qf = summary_pack.get("quality_flags")
+            if isinstance(qf, dict):
+                quality_flags = {
+                    "transcript_too_short": bool(qf.get("transcript_too_short", False)),
+                    "low_signal": bool(qf.get("low_signal", False)),
+                }
+
+        # Evidence quotes aggregate (questions + objections + summary + topic_tag_evidence)
         evidence_quotes: List[str] = []
         for q in questions[:25]:
-            ev = q.get("evidence_quote")
-            if ev:
-                evidence_quotes.append(ev)
+            if isinstance(q, dict) and q.get("evidence_quote"):
+                evidence_quotes.append(q["evidence_quote"])
         for o in objections[:25]:
-            ev = o.get("evidence_quote")
-            if ev:
-                evidence_quotes.append(ev)
-
+            if isinstance(o, dict) and o.get("evidence_quote"):
+                evidence_quotes.append(o["evidence_quote"])
         evidence_quotes.extend(summary_evidence[:25])
         evidence_quotes.extend(topic_tag_evidence_quotes[:25])
+        evidence_quotes = dedupe_preserve_order(evidence_quotes)[:25]
 
-        seen = set()
-        deduped = []
-        for ev in evidence_quotes:
-            if ev not in seen:
-                seen.add(ev)
-                deduped.append(ev)
-
+        # bullets
         top_bullets = []
         for q in questions[:7]:
-            norm = q.get("normalized") or q.get("verbatim")
-            if norm:
-                top_bullets.append(f"- {norm}")
+            if isinstance(q, dict):
+                norm = q.get("normalized") or q.get("verbatim")
+                if norm:
+                    top_bullets.append(f"- {norm}")
+
+        result_obj = {
+            "call_id": payload.clari_call_id or "",
+            "questions": questions,
+            "objections": objections,
+            "product_feedback": product_feedback,
+            "buying_signals": buying_signals,
+            "summary_10_lines": summary_lines_json,
+            "topic_tags": topic_tags,
+            "topic_tag_evidence": topic_tag_evidence_quotes,
+            "quality_flags": quality_flags,
+        }
 
         return {
             "analysis_status": "processed",
             "analysis_error": "",
             "analysis_last_run_at": now_iso(),
-            "extraction_json": json.dumps(result),
+            "extraction_json": json.dumps(result_obj),
             "questions_json": json.dumps(questions),
             "objections_json": json.dumps(objections),
             "product_feedback_json": json.dumps(product_feedback),
             "buying_signals_json": json.dumps(buying_signals),
+            "summary_lines_json": json.dumps(summary_lines_json),
             "topic_tags": topic_tags,
-            "top_questions_bullets": "\n".join(top_bullets),
-            "evidence_quotes_json": json.dumps(deduped[:25]),
-            "summary_lines_json": json.dumps(summary_lines),
             "topic_tag_evidence_json": json.dumps(topic_tag_evidence_quotes),
-            "debug_model_output": raw_text[:4000],
+            "top_questions_bullets": "\n".join(top_bullets),
+            "evidence_quotes_json": json.dumps(evidence_quotes),
+            "debug_model_output": "\n\n---\n\n".join(debug_blobs)[:4000],
         }
 
     except Exception as e:
@@ -482,10 +576,10 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "objections_json": json.dumps([]),
             "product_feedback_json": json.dumps([]),
             "buying_signals_json": json.dumps([]),
+            "summary_lines_json": json.dumps([]),
             "topic_tags": [],
+            "topic_tag_evidence_json": json.dumps([]),
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
-            "summary_lines_json": json.dumps([]),
-            "topic_tag_evidence_json": json.dumps([]),
-            "debug_model_output": (raw_text[:4000] if raw_text else ""),
+            "debug_model_output": ("\n\n---\n\n".join(debug_blobs)[:4000] if debug_blobs else ""),
         }
