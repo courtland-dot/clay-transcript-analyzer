@@ -12,30 +12,21 @@ from pydantic import BaseModel, Field
 # Env
 # ----------------------------
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
-
-# Default to a model that your /v1/models output shows exists
-# (You can override via Render env var CLAUDE_MODEL)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
-
-# Optional shared-secret auth for /analyze
 AUTH_TOKEN = os.environ.get("ANALYZER_AUTH_TOKEN", "")
 
-# Regal domains to suppress / identify internal speakers
 REGAL_DOMAINS = set(
     d.strip().lower()
     for d in os.environ.get("REGAL_DOMAINS", "regalvoice.com,regal.ai,regal.io").split(",")
     if d.strip()
 )
 
-# Optional: pipe-separated list of employee full names for internal speaker detection
-# e.g. "Alex Catalisan|Maaria Khalid|Courtland Nicholas"
 EMPLOYEE_NAMES: List[str] = [
     n.strip() for n in os.environ.get("REGAL_EMPLOYEE_NAMES", "").split("|") if n.strip()
 ]
 EMPLOYEE_NAMES_LOWER = {n.lower() for n in EMPLOYEE_NAMES}
 
 app = FastAPI()
-
 
 # ----------------------------
 # Models
@@ -47,13 +38,11 @@ class AnalyzeIn(BaseModel):
     segment: str | None = None
     transcript: str = Field(..., min_length=1)
 
-
 # ----------------------------
 # Utils
 # ----------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def domain_from_email(email: str) -> str:
     email = (email or "").strip()
@@ -61,12 +50,7 @@ def domain_from_email(email: str) -> str:
         return ""
     return email.split("@", 1)[1].strip().lower()
 
-
 def display_from_email(email: str) -> str:
-    """
-    Best-effort display name from email local-part.
-    thea.rasmussen@broadrch.com -> thea rasmussen -> Thea Rasmussen
-    """
     email = (email or "").strip()
     if "@" not in email:
         return ""
@@ -74,21 +58,17 @@ def display_from_email(email: str) -> str:
     local = re.sub(r"[._\-]+", " ", local).strip()
     return " ".join(w.capitalize() for w in local.split() if w)
 
-
 def looks_like_email(s: str) -> bool:
     s = (s or "").strip()
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s))
 
-
 def extract_first_json_object(text: str) -> str:
     """
     Extract the first top-level JSON object from a string.
-    Handles cases where the model returns extra text before/after the JSON.
-    Raises ValueError if no JSON object is found.
+    Handles extra text before/after JSON.
     """
     s = (text or "").strip()
 
-    # Fast path: already looks like a standalone JSON object
     if s.startswith("{") and s.endswith("}"):
         return s
 
@@ -102,7 +82,6 @@ def extract_first_json_object(text: str) -> str:
 
     for i in range(start, len(s)):
         ch = s[i]
-
         if in_str:
             if esc:
                 esc = False
@@ -120,25 +99,13 @@ def extract_first_json_object(text: str) -> str:
                 if depth == 0:
                     return s[start : i + 1]
 
+    # If we get here, we found "{" but never closed it -> most likely truncation
     raise ValueError("Could not find a complete JSON object in model output")
-
 
 # ----------------------------
 # Speaker parsing + normalization
 # ----------------------------
 def parse_speaker_header(line: str) -> Tuple[str, str, str]:
-    """
-    Parse a speaker line like:
-      "thea.rasmussen@broadrch.com: blah"
-      "Christina Scorsis: blah"
-      "alex@regalvoice.com: blah"
-      "Patrice: blah"
-
-    Returns (display, email, domain)
-    - display: human name or email-derived display
-    - email: if present, else ""
-    - domain: if email present, else ""
-    """
     if ":" not in line:
         return "", "", ""
 
@@ -146,42 +113,25 @@ def parse_speaker_header(line: str) -> Tuple[str, str, str]:
     if not left:
         return "", "", ""
 
-    # If left is an email
     if looks_like_email(left):
         email = left
         dom = domain_from_email(email)
         display = display_from_email(email) or email
         return display, email, dom
 
-    # Otherwise treat as display name
-    display = left
-    return display, "", ""
-
+    return left, "", ""
 
 def is_regal_speaker(display: str, email: str, dom: str) -> bool:
     dom = (dom or "").lower()
     if dom and dom in REGAL_DOMAINS:
         return True
-
-    # If email is internal even if dom not parsed
     if email and domain_from_email(email) in REGAL_DOMAINS:
         return True
-
-    # If display matches known employee names (optional)
     if display and display.strip().lower() in EMPLOYEE_NAMES_LOWER:
         return True
-
     return False
 
-
 def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, str]:
-    """
-    Produce stable speaker fields while suppressing Regal.
-    speaker_type: "regal" or "prospect"
-    speaker_display: best display label
-    speaker_email: keep only for non-Regal if present
-    speaker_company: for non-Regal, prefer domain if present else "unknown"
-    """
     display = (display or "").strip()
     email = (email or "").strip()
     dom = (dom or "").strip().lower()
@@ -189,17 +139,14 @@ def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, st
     regal = is_regal_speaker(display, email, dom)
     speaker_type = "regal" if regal else "prospect"
 
-    # Display preference:
-    # - If provided display is an email, convert to pretty name if possible
-    # - Else keep as is
     if looks_like_email(display):
         pretty = display_from_email(display)
         speaker_display = pretty or display
     else:
         speaker_display = display or (display_from_email(email) if email else "Unknown")
 
-    # Email + company only for prospects
     speaker_email = "" if regal else (email or "")
+
     speaker_company = "unknown"
     if not regal:
         if dom:
@@ -214,26 +161,18 @@ def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, st
         "speaker_company": speaker_company,
     }
 
-
 def enrich_transcript_for_attribution(transcript: str) -> str:
     """
-    Rewrite each speaker line to a consistent format that helps the model:
-      SPEAKER[prospect|regal] display=<...> email=<...> company=<...>: utterance...
-
-    Enhancements:
-    - Speaker identity memory within a single transcript:
-        If we see "Patrice" with an email once, later "Patrice:" lines inherit that email/company.
-    - Keeps original utterance unchanged.
-    - Non-speaker lines pass through unchanged.
+    SPEAKER identity memory inside the same transcript:
+    if we see a speaker name with an email once, reuse it later.
     """
     out_lines: List[str] = []
-
-    # In-transcript identity memory: display(lower) -> (email, domain)
-    speaker_memory: Dict[str, Tuple[str, str]] = {}
+    speaker_memory: Dict[str, Tuple[str, str]] = {}  # display(lower) -> (email, domain)
 
     for raw_line in (transcript or "").splitlines():
         line = raw_line.rstrip("\n")
         display, email, dom = parse_speaker_header(line)
+
         if not display:
             out_lines.append(raw_line)
             continue
@@ -244,13 +183,10 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
             continue
         utterance = parts[1].strip()
 
-        key = (display or "").strip().lower()
+        key = display.strip().lower()
 
-        # If this line includes an email, remember it for this speaker display
         if email:
             speaker_memory[key] = (email, dom or "")
-
-        # If this line has no email, but we've seen this speaker before, inherit it
         elif key in speaker_memory:
             remembered_email, remembered_dom = speaker_memory[key]
             email = remembered_email
@@ -265,16 +201,10 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
 
     return "\n".join(out_lines)
 
-
 # ----------------------------
 # Prompting
 # ----------------------------
 def build_prompt(payload: AnalyzeIn) -> str:
-    """
-    Updated schema:
-    - summary_10_lines is now a list of objects: {line, evidence_quote}
-    - topic_tags must be grounded and each must have evidence in topic_tag_evidence
-    """
     call_id = payload.clari_call_id or ""
     sf_opp_id = payload.salesforce_opp_id or ""
     stage = payload.stage_at_time or ""
@@ -283,21 +213,25 @@ def build_prompt(payload: AnalyzeIn) -> str:
     enriched = enrich_transcript_for_attribution(payload.transcript)
 
     return f"""
-You are an information extraction engine. You must output VALID JSON ONLY (no markdown, no backticks, no commentary).
+You must output VALID JSON ONLY. No markdown. No backticks. No commentary.
 Only extract items from lines labeled SPEAKER[prospect]. Ignore SPEAKER[regal] lines entirely.
 
 HARD EVIDENCE RULES (NO EXCEPTIONS):
 - Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript.
-- The evidence_quote MUST include the SPEAKER[prospect] prefix line content verbatim as it appears.
+- The evidence_quote MUST include the SPEAKER[prospect] prefix verbatim as it appears.
 - If you cannot find a verbatim quote supporting an item, OMIT the item.
-- Do not infer. Do not guess. Do not fabricate names, integrations, compliance requirements, numbers, timelines, outcomes, sentiment, or next-step commitments.
+- Do not infer. Do not guess. Do not fabricate.
 
-NORMALIZATION RULES:
-- You may normalize ONLY in: normalized, tags, topic_tags
-- NEVER normalize inside evidence_quote (evidence_quote must be copied verbatim from transcript).
-- Example: transcript says "five nights" -> you MAY tag "five9", but evidence_quote must still show "five nights".
+OUTPUT SIZE LIMITS (IMPORTANT):
+- questions: max 12
+- objections: max 12
+- product_feedback: max 12
+- buying_signals: max 12
+- summary_10_lines: max 10 (return fewer if you can’t ground them)
+- topic_tags: max 15
+- topic_tag_evidence: max 25
 
-Return JSON with this schema (VALID JSON ONLY):
+Return JSON with this schema:
 
 {{
   "call_id": "{call_id}",
@@ -350,14 +284,12 @@ Return JSON with this schema (VALID JSON ONLY):
       "confidence": 0.0
     }}
   ],
-
   "summary_10_lines": [
     {{
       "line": "",
       "evidence_quote": ""
     }}
   ],
-
   "topic_tags": ["..."],
   "topic_tag_evidence": [
     {{
@@ -365,29 +297,18 @@ Return JSON with this schema (VALID JSON ONLY):
       "evidence_quote": ""
     }}
   ],
-
   "quality_flags": {{
     "transcript_too_short": false,
     "low_signal": false
   }}
 }}
 
-RULES:
+Rules:
 - Output JSON only.
 - Keep verbatim fields short (<= 240 chars).
-- "normalized" should be reusable as a FAQ/blog title.
-- "tags" should include specific systems/terms if present (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
-- Confidence is 0.0 to 1.0 and should be conservative.
-
-SUMMARY REQUIREMENTS:
-- Each summary line MUST be grounded with evidence_quote that is an exact substring (including SPEAKER[prospect] prefix).
-- Do NOT mention any fact in summary that does not appear verbatim in transcript.
-- If fewer than 10 grounded lines exist, return fewer lines (0-10).
-
-TOPIC TAG REQUIREMENTS:
-- Each topic_tag MUST have at least one corresponding entry in topic_tag_evidence.
-- If you cannot provide evidence for a topic_tag, do not include that tag.
-- Keep topic_tags stable, lowercase, snake_case.
+- normalized should be a reusable FAQ/blog title.
+- tags/topic_tags must be grounded (no guessing).
+- topic_tags must be lowercase snake_case.
 
 Inputs:
 clari_call_id: {call_id}
@@ -395,15 +316,14 @@ salesforce_opp_id: {sf_opp_id}
 stage_at_time: {stage}
 segment: {segment}
 
-transcript (with SPEAKER prefixes):
+transcript:
 {enriched}
 """.strip()
 
-
 # ----------------------------
-# Anthropic call
+# Anthropic call (RAW TEXT ONLY)
 # ----------------------------
-def call_claude(prompt: str) -> Tuple[dict, str]:
+def call_claude_raw(prompt: str) -> str:
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": CLAUDE_API_KEY,
@@ -412,8 +332,10 @@ def call_claude(prompt: str) -> Tuple[dict, str]:
     }
     body = {
         "model": CLAUDE_MODEL,
-        "max_tokens": 3000,
+        # Bump this to reduce truncation risk
+        "max_tokens": 5000,
         "temperature": 0,
+        "system": "Return only a single valid JSON object. Do not include any other text.",
         "messages": [{"role": "user", "content": prompt}],
     }
 
@@ -429,34 +351,22 @@ def call_claude(prompt: str) -> Tuple[dict, str]:
     data = r.json()
     content = data.get("content", [])
 
-    raw_text = ""
-    if isinstance(content, list) and content:
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
-                parts.append(block["text"])
-        raw_text = "\n".join(parts).strip()
+    if not isinstance(content, list) or not content:
+        return ""
 
-    if not raw_text:
-        raise ValueError("Claude response missing text content")
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
+            parts.append(block["text"])
 
-    json_text = extract_first_json_object(raw_text)
-    return json.loads(json_text), raw_text
-
+    return "\n".join(parts).strip()
 
 # ----------------------------
-# Helpers for post-processing new schema
+# Post-processing helpers
 # ----------------------------
 def coerce_summary_lines(summary_val) -> Tuple[List[str], List[str]]:
-    """
-    Supports:
-    - new: [{"line": "...", "evidence_quote": "SPEAKER[prospect] ..."}]
-    - old: ["..."]
-    Returns (lines, evidence_quotes)
-    """
     lines: List[str] = []
     evs: List[str] = []
-
     if isinstance(summary_val, list):
         for item in summary_val:
             if isinstance(item, dict):
@@ -470,15 +380,9 @@ def coerce_summary_lines(summary_val) -> Tuple[List[str], List[str]]:
                 s = item.strip()
                 if s:
                     lines.append(s)
-
     return lines, evs
 
-
 def coerce_topic_tag_evidence(val) -> List[str]:
-    """
-    Expected: [{"topic_tag": "...", "evidence_quote": "..."}]
-    Returns evidence_quote list (strings)
-    """
     evs: List[str] = []
     if isinstance(val, list):
         for item in val:
@@ -488,7 +392,6 @@ def coerce_topic_tag_evidence(val) -> List[str]:
                     evs.append(ev)
     return evs
 
-
 # ----------------------------
 # Routes
 # ----------------------------
@@ -496,10 +399,8 @@ def coerce_topic_tag_evidence(val) -> List[str]:
 def health():
     return {"ok": True, "ts": now_iso(), "model": CLAUDE_MODEL}
 
-
 @app.post("/analyze")
 def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)):
-    # Optional shared-secret gate
     if AUTH_TOKEN:
         if not authorization or authorization != f"Bearer {AUTH_TOKEN}":
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -529,7 +430,6 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "topic_tags": [],
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
-            # Optional additional flat fields (safe for Clay mapping later)
             "summary_lines_json": json.dumps([]),
             "topic_tag_evidence_json": json.dumps([]),
         }
@@ -537,7 +437,13 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
     raw_text = ""
     try:
         prompt = build_prompt(payload)
-        result, raw_text = call_claude(prompt)
+        raw_text = call_claude_raw(prompt)
+
+        if not raw_text:
+            raise ValueError("Claude returned empty text content")
+
+        json_text = extract_first_json_object(raw_text)
+        result = json.loads(json_text)
 
         questions = result.get("questions", []) or []
         objections = result.get("objections", []) or []
@@ -549,8 +455,6 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
         topic_tag_evidence_quotes = coerce_topic_tag_evidence(result.get("topic_tag_evidence", []))
 
         evidence_quotes: List[str] = []
-
-        # Pull evidence from questions/objections
         for q in questions[:25]:
             ev = q.get("evidence_quote")
             if ev:
@@ -560,11 +464,9 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             if ev:
                 evidence_quotes.append(ev)
 
-        # Add evidence from summary and topic tags (new schema)
         evidence_quotes.extend(summary_evidence[:25])
         evidence_quotes.extend(topic_tag_evidence_quotes[:25])
 
-        # Dedupe evidence quotes while preserving order
         seen = set()
         deduped_quotes = []
         for q in evidence_quotes:
@@ -590,9 +492,10 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "topic_tags": topic_tags,
             "top_questions_bullets": "\n".join(top_bullets),
             "evidence_quotes_json": json.dumps(deduped_quotes[:25]),
-            # Optional additional flat fields (nice for Clay column mapping)
             "summary_lines_json": json.dumps(summary_lines),
             "topic_tag_evidence_json": json.dumps(topic_tag_evidence_quotes),
+            # Helpful for Clay debugging when needed:
+            "debug_model_output": raw_text[:4000],
         }
 
     except Exception as e:
@@ -610,5 +513,6 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "evidence_quotes_json": json.dumps([]),
             "summary_lines_json": json.dumps([]),
             "topic_tag_evidence_json": json.dumps([]),
+            # NOW this will actually show what Claude returned (even if invalid JSON)
             "debug_model_output": (raw_text[:4000] if raw_text else ""),
         }
