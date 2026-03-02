@@ -65,7 +65,7 @@ def looks_like_email(s: str) -> bool:
 def extract_first_json_object(text: str) -> str:
     """
     Extract the first top-level JSON object from a string.
-    Handles extra text before/after JSON.
+    Raises ValueError if the object is incomplete (common when model output truncates).
     """
     s = (text or "").strip()
 
@@ -99,7 +99,6 @@ def extract_first_json_object(text: str) -> str:
                 if depth == 0:
                     return s[start : i + 1]
 
-    # If we get here, we found "{" but never closed it -> most likely truncation
     raise ValueError("Could not find a complete JSON object in model output")
 
 # ----------------------------
@@ -163,8 +162,8 @@ def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, st
 
 def enrich_transcript_for_attribution(transcript: str) -> str:
     """
-    SPEAKER identity memory inside the same transcript:
-    if we see a speaker name with an email once, reuse it later.
+    Adds consistent SPEAKER[...] prefix lines and remembers prospect identity
+    within a single transcript (name -> email/domain).
     """
     out_lines: List[str] = []
     speaker_memory: Dict[str, Tuple[str, str]] = {}  # display(lower) -> (email, domain)
@@ -185,8 +184,10 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
 
         key = display.strip().lower()
 
+        # remember email/domain when present
         if email:
             speaker_memory[key] = (email, dom or "")
+        # inherit if missing
         elif key in speaker_memory:
             remembered_email, remembered_dom = speaker_memory[key]
             email = remembered_email
@@ -202,113 +203,75 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
     return "\n".join(out_lines)
 
 # ----------------------------
-# Prompting
+# Prompting (smaller + retry-friendly)
 # ----------------------------
-def build_prompt(payload: AnalyzeIn) -> str:
+def build_prompt(payload: AnalyzeIn, enriched_transcript: str, retry_small: bool = False) -> str:
     call_id = payload.clari_call_id or ""
     sf_opp_id = payload.salesforce_opp_id or ""
     stage = payload.stage_at_time or ""
     segment = payload.segment or ""
 
-    enriched = enrich_transcript_for_attribution(payload.transcript)
+    # tighter limits on retry to prevent truncation
+    if retry_small:
+        limits = {
+            "questions": 6,
+            "objections": 6,
+            "product_feedback": 6,
+            "buying_signals": 6,
+            "summary_lines": 6,
+            "topic_tags": 10,
+            "topic_tag_evidence": 12,
+            "evidence_quote_chars": 220,
+        }
+    else:
+        limits = {
+            "questions": 12,
+            "objections": 12,
+            "product_feedback": 12,
+            "buying_signals": 12,
+            "summary_lines": 10,
+            "topic_tags": 15,
+            "topic_tag_evidence": 25,
+            "evidence_quote_chars": 320,
+        }
 
     return f"""
-You must output VALID JSON ONLY. No markdown. No backticks. No commentary.
-Only extract items from lines labeled SPEAKER[prospect]. Ignore SPEAKER[regal] lines entirely.
+Return ONLY one valid JSON object. No markdown. No backticks. No extra text.
+Only extract items from lines labeled SPEAKER[prospect]. Ignore SPEAKER[regal] completely.
 
-HARD EVIDENCE RULES (NO EXCEPTIONS):
-- Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript.
-- The evidence_quote MUST include the SPEAKER[prospect] prefix verbatim as it appears.
-- If you cannot find a verbatim quote supporting an item, OMIT the item.
-- Do not infer. Do not guess. Do not fabricate.
+Hard evidence rules:
+- Every extracted item MUST include evidence_quote that is an exact, verbatim substring from the transcript.
+- evidence_quote MUST include the SPEAKER[prospect] prefix exactly as shown in the transcript.
+- If you cannot support an item with an exact quote, OMIT it. Do not infer or guess.
 
-OUTPUT SIZE LIMITS (IMPORTANT):
-- questions: max 12
-- objections: max 12
-- product_feedback: max 12
-- buying_signals: max 12
-- summary_10_lines: max 10 (return fewer if you can’t ground them)
-- topic_tags: max 15
-- topic_tag_evidence: max 25
+Output size limits (must obey):
+- questions max {limits["questions"]}
+- objections max {limits["objections"]}
+- product_feedback max {limits["product_feedback"]}
+- buying_signals max {limits["buying_signals"]}
+- summary_10_lines max {limits["summary_lines"]} (each line must include evidence_quote)
+- topic_tags max {limits["topic_tags"]}
+- topic_tag_evidence max {limits["topic_tag_evidence"]}
+- Each evidence_quote must be <= {limits["evidence_quote_chars"]} chars (truncate the quote if longer, but keep it verbatim substring).
 
-Return JSON with this schema:
-
+Required JSON schema (keys must exist; arrays can be empty):
 {{
   "call_id": "{call_id}",
-  "questions": [
-    {{
-      "verbatim": "",
-      "speaker_display": "",
-      "speaker_email": "",
-      "speaker_company": "",
-      "speaker_type": "prospect",
-      "normalized": "",
-      "category": "integration|security|pricing|implementation|product|roi|timeline|other",
-      "tags": ["..."],
-      "evidence_quote": "",
-      "confidence": 0.0
-    }}
-  ],
-  "objections": [
-    {{
-      "verbatim": "",
-      "speaker_display": "",
-      "speaker_email": "",
-      "speaker_company": "",
-      "speaker_type": "prospect",
-      "category": "integration|security|pricing|implementation|product|roi|timeline|other",
-      "evidence_quote": "",
-      "confidence": 0.0
-    }}
-  ],
-  "product_feedback": [
-    {{
-      "type": "feature_request|bug|confusion|missing_capability|competitor_comparison|implementation_friction",
-      "verbatim": "",
-      "speaker_display": "",
-      "speaker_email": "",
-      "speaker_company": "",
-      "speaker_type": "prospect",
-      "evidence_quote": ""
-    }}
-  ],
-  "buying_signals": [
-    {{
-      "type": "exec_sponsorship|clear_success_criteria|urgency|strong_value_alignment|procurement_motion|next_steps_committed",
-      "verbatim": "",
-      "speaker_display": "",
-      "speaker_email": "",
-      "speaker_company": "",
-      "speaker_type": "prospect",
-      "evidence_quote": "",
-      "confidence": 0.0
-    }}
-  ],
-  "summary_10_lines": [
-    {{
-      "line": "",
-      "evidence_quote": ""
-    }}
-  ],
-  "topic_tags": ["..."],
-  "topic_tag_evidence": [
-    {{
-      "topic_tag": "",
-      "evidence_quote": ""
-    }}
-  ],
-  "quality_flags": {{
-    "transcript_too_short": false,
-    "low_signal": false
-  }}
+  "questions": [{{"verbatim":"","speaker_display":"","speaker_email":"","speaker_company":"","speaker_type":"prospect","normalized":"","category":"integration|security|pricing|implementation|product|roi|timeline|other","tags":[],"evidence_quote":"","confidence":0.0}}],
+  "objections": [{{"verbatim":"","speaker_display":"","speaker_email":"","speaker_company":"","speaker_type":"prospect","category":"integration|security|pricing|implementation|product|roi|timeline|other","evidence_quote":"","confidence":0.0}}],
+  "product_feedback": [{{"type":"feature_request|bug|confusion|missing_capability|competitor_comparison|implementation_friction","verbatim":"","speaker_display":"","speaker_email":"","speaker_company":"","speaker_type":"prospect","evidence_quote":""}}],
+  "buying_signals": [{{"type":"exec_sponsorship|clear_success_criteria|urgency|strong_value_alignment|procurement_motion|next_steps_committed","verbatim":"","speaker_display":"","speaker_email":"","speaker_company":"","speaker_type":"prospect","evidence_quote":"","confidence":0.0}}],
+  "summary_10_lines": [{{"line":"","evidence_quote":""}}],
+  "topic_tags": [],
+  "topic_tag_evidence": [{{"topic_tag":"","evidence_quote":""}}],
+  "quality_flags": {{"transcript_too_short": false, "low_signal": false}}
 }}
 
-Rules:
-- Output JSON only.
-- Keep verbatim fields short (<= 240 chars).
-- normalized should be a reusable FAQ/blog title.
-- tags/topic_tags must be grounded (no guessing).
-- topic_tags must be lowercase snake_case.
+Other rules:
+- confidence 0.0–1.0 conservative
+- normalized should be reusable as FAQ/blog title
+- tags/topic_tags must be grounded in the transcript (no guessing)
+- topic_tags must be lowercase snake_case
 
 Inputs:
 clari_call_id: {call_id}
@@ -317,13 +280,13 @@ stage_at_time: {stage}
 segment: {segment}
 
 transcript:
-{enriched}
+{enriched_transcript}
 """.strip()
 
 # ----------------------------
 # Anthropic call (RAW TEXT ONLY)
 # ----------------------------
-def call_claude_raw(prompt: str) -> str:
+def call_claude_raw(prompt: str, max_tokens: int = 8000) -> str:
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": CLAUDE_API_KEY,
@@ -332,8 +295,7 @@ def call_claude_raw(prompt: str) -> str:
     }
     body = {
         "model": CLAUDE_MODEL,
-        # Bump this to reduce truncation risk
-        "max_tokens": 5000,
+        "max_tokens": max_tokens,
         "temperature": 0,
         "system": "Return only a single valid JSON object. Do not include any other text.",
         "messages": [{"role": "user", "content": prompt}],
@@ -364,7 +326,7 @@ def call_claude_raw(prompt: str) -> str:
 # ----------------------------
 # Post-processing helpers
 # ----------------------------
-def coerce_summary_lines(summary_val) -> Tuple[List[str], List[str]]:
+def coerce_summary_lines(summary_val):
     lines: List[str] = []
     evs: List[str] = []
     if isinstance(summary_val, list):
@@ -382,7 +344,7 @@ def coerce_summary_lines(summary_val) -> Tuple[List[str], List[str]]:
                     lines.append(s)
     return lines, evs
 
-def coerce_topic_tag_evidence(val) -> List[str]:
+def coerce_topic_tag_evidence(val):
     evs: List[str] = []
     if isinstance(val, list):
         for item in val:
@@ -432,17 +394,30 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "evidence_quotes_json": json.dumps([]),
             "summary_lines_json": json.dumps([]),
             "topic_tag_evidence_json": json.dumps([]),
+            "debug_model_output": "",
         }
 
     raw_text = ""
     try:
-        prompt = build_prompt(payload)
-        raw_text = call_claude_raw(prompt)
+        enriched = enrich_transcript_for_attribution(transcript)
+
+        # Attempt 1 (normal)
+        prompt = build_prompt(payload, enriched, retry_small=False)
+        raw_text = call_claude_raw(prompt, max_tokens=8000)
 
         if not raw_text:
             raise ValueError("Claude returned empty text content")
 
-        json_text = extract_first_json_object(raw_text)
+        try:
+            json_text = extract_first_json_object(raw_text)
+        except Exception:
+            # Attempt 2 (smaller output to avoid truncation)
+            retry_prompt = build_prompt(payload, enriched, retry_small=True)
+            raw_text = call_claude_raw(retry_prompt, max_tokens=8000)
+            if not raw_text:
+                raise ValueError("Claude returned empty text content (retry)")
+            json_text = extract_first_json_object(raw_text)
+
         result = json.loads(json_text)
 
         questions = result.get("questions", []) or []
@@ -468,11 +443,11 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
         evidence_quotes.extend(topic_tag_evidence_quotes[:25])
 
         seen = set()
-        deduped_quotes = []
-        for q in evidence_quotes:
-            if q not in seen:
-                seen.add(q)
-                deduped_quotes.append(q)
+        deduped = []
+        for ev in evidence_quotes:
+            if ev not in seen:
+                seen.add(ev)
+                deduped.append(ev)
 
         top_bullets = []
         for q in questions[:7]:
@@ -491,10 +466,9 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "buying_signals_json": json.dumps(buying_signals),
             "topic_tags": topic_tags,
             "top_questions_bullets": "\n".join(top_bullets),
-            "evidence_quotes_json": json.dumps(deduped_quotes[:25]),
+            "evidence_quotes_json": json.dumps(deduped[:25]),
             "summary_lines_json": json.dumps(summary_lines),
             "topic_tag_evidence_json": json.dumps(topic_tag_evidence_quotes),
-            # Helpful for Clay debugging when needed:
             "debug_model_output": raw_text[:4000],
         }
 
@@ -513,6 +487,5 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "evidence_quotes_json": json.dumps([]),
             "summary_lines_json": json.dumps([]),
             "topic_tag_evidence_json": json.dumps([]),
-            # NOW this will actually show what Claude returned (even if invalid JSON)
             "debug_model_output": (raw_text[:4000] if raw_text else ""),
         }
