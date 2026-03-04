@@ -464,6 +464,102 @@ Rules:
 # ----------------------------
 # Anthropic call
 # ----------------------------
+def _maybe_json_load(s: str):
+    """
+    Try to json.loads a string if it looks like JSON; otherwise return None.
+    """
+    if not isinstance(s, str):
+        return None
+    t = s.strip()
+    if not t:
+        return None
+    if not (t.startswith("{") or t.startswith("[")):
+        return None
+    try:
+        return json.loads(t)
+    except Exception:
+        return None
+
+
+def _coerce_double_encoded(obj):
+    """
+    Fix common Claude failure mode: fields that should be lists/objects are returned
+    as JSON-encoded strings.
+
+    Examples:
+      {"questions": "{...full schema...}"}   -> returns the inner object
+      {"questions": "[{...}]", ...}          -> questions becomes a list
+    """
+    # If the entire object is a JSON string, decode it
+    if isinstance(obj, str):
+        decoded = _maybe_json_load(obj)
+        return decoded if decoded is not None else obj
+
+    if not isinstance(obj, dict):
+        return obj
+
+    # If it's a wrapper dict with a single key whose value is JSON, unwrap
+    if len(obj) == 1:
+        only_val = next(iter(obj.values()))
+        if isinstance(only_val, str):
+            decoded = _maybe_json_load(only_val)
+            if isinstance(decoded, dict):
+                return _coerce_double_encoded(decoded)
+
+    # Otherwise, walk fields and decode any JSON-looking strings
+    fixed = {}
+    for k, v in obj.items():
+        if isinstance(v, str):
+            decoded = _maybe_json_load(v)
+            fixed[k] = decoded if decoded is not None else v
+        elif isinstance(v, dict):
+            fixed[k] = _coerce_double_encoded(v)
+        elif isinstance(v, list):
+            # Also decode list elements that are JSON strings
+            new_list = []
+            for item in v:
+                if isinstance(item, str):
+                    decoded_item = _maybe_json_load(item)
+                    new_list.append(decoded_item if decoded_item is not None else item)
+                else:
+                    new_list.append(_coerce_double_encoded(item) if isinstance(item, dict) else item)
+            fixed[k] = new_list
+        else:
+            fixed[k] = v
+
+    return fixed
+
+
+def _parse_claude_json(raw_text: str) -> dict:
+    """
+    Parse Claude output into a dict, tolerating:
+    - pre/post text around JSON
+    - double-encoded JSON fields
+    """
+    t = (raw_text or "").strip()
+    if not t:
+        raise ValueError("Empty model output")
+
+    # If the model (or proxy) returned HTML, fail fast with a clearer error
+    if t.startswith("<!DOCTYPE") or t.startswith("<html") or "<title>502</title>" in t:
+        raise ValueError("Upstream returned HTML (likely 502/timeout).")
+
+    # Try direct JSON parse first
+    direct = _maybe_json_load(t)
+    if isinstance(direct, dict):
+        return _coerce_double_encoded(direct)
+
+    # Otherwise extract first object and parse
+    json_text = extract_first_json_object(t)
+    parsed = json.loads(json_text)
+
+    if isinstance(parsed, dict):
+        return _coerce_double_encoded(parsed)
+
+    # If it's a list or something else, return as error (schema expects dict)
+    raise ValueError("Model output JSON was not an object")
+
+
 def call_claude(prompt: str, max_tokens: int) -> Tuple[dict, str]:
     url = "https://api.anthropic.com/v1/messages"
     headers = {
@@ -478,7 +574,12 @@ def call_claude(prompt: str, max_tokens: int) -> Tuple[dict, str]:
         "messages": [{"role": "user", "content": prompt}],
     }
 
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=CLAUDE_TIMEOUT_SECS)
+    r = requests.post(
+        url,
+        headers=headers,
+        data=json.dumps(body),
+        timeout=CLAUDE_TIMEOUT_SECS,
+    )
 
     if r.status_code >= 400:
         try:
@@ -490,20 +591,20 @@ def call_claude(prompt: str, max_tokens: int) -> Tuple[dict, str]:
     data = r.json()
     content = data.get("content", [])
 
-    raw_text = ""
-    if isinstance(content, list) and content:
-        parts = []
+    # Anthropic returns blocks like [{"type":"text","text":"..."}]
+    raw_text_parts = []
+    if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
-                parts.append(block["text"])
-        raw_text = "\n".join(parts).strip()
+                raw_text_parts.append(block["text"])
+    raw_text = "\n".join(raw_text_parts).strip()
 
     if not raw_text:
-        raise ValueError("Claude response missing text content")
+        # include the full response body for debugging if content is missing
+        raise ValueError(f"Claude response missing text content. keys={list(data.keys())}")
 
-    json_text = extract_first_json_object(raw_text)
-    return json.loads(json_text), raw_text
-
+    parsed = _parse_claude_json(raw_text)
+    return parsed, raw_text
 
 # ----------------------------
 # Routes
