@@ -2,43 +2,38 @@ import os
 import json
 import re
 from datetime import datetime, timezone
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
+from requests.exceptions import ReadTimeout, ConnectTimeout
 
 # ----------------------------
 # Env
 # ----------------------------
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
-
-# Default to a model that your /v1/models output shows exists
-# (You can override via Render env var CLAUDE_MODEL)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
-# Optional shared-secret auth for /analyze
-AUTH_TOKEN = os.environ.get("ANALYZER_AUTH_TOKEN", "")
-
-# Timeouts / token limits
-CLAUDE_TIMEOUT_SECS = int(os.environ.get("CLAUDE_TIMEOUT_SECS", "120"))
+# IMPORTANT: Clay + Anthropic often needs > 18s
+CLAUDE_TIMEOUT_SECS = int(os.environ.get("CLAUDE_TIMEOUT_SECS", "90"))
 CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "3000"))
 
-# Regal domains to suppress / identify internal speakers
+AUTH_TOKEN = os.environ.get("ANALYZER_AUTH_TOKEN", "")
+
 REGAL_DOMAINS = set(
     d.strip().lower()
     for d in os.environ.get("REGAL_DOMAINS", "regalvoice.com,regal.ai,regal.io").split(",")
     if d.strip()
 )
 
-# Optional: pipe-separated list of employee full names for internal speaker detection
-# e.g. "Alex Catalisan|Maaria Khalid|Courtland Nicholas"
 EMPLOYEE_NAMES: List[str] = [
     n.strip() for n in os.environ.get("REGAL_EMPLOYEE_NAMES", "").split("|") if n.strip()
 ]
 EMPLOYEE_NAMES_LOWER = {n.lower() for n in EMPLOYEE_NAMES}
 
 app = FastAPI()
+
 
 # ----------------------------
 # Models
@@ -50,11 +45,13 @@ class AnalyzeIn(BaseModel):
     segment: str | None = None
     transcript: str = Field(..., min_length=1)
 
+
 # ----------------------------
 # Utils
 # ----------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def domain_from_email(email: str) -> str:
     email = (email or "").strip()
@@ -62,11 +59,8 @@ def domain_from_email(email: str) -> str:
         return ""
     return email.split("@", 1)[1].strip().lower()
 
+
 def display_from_email(email: str) -> str:
-    """
-    Best-effort display name from email local-part.
-    thea.rasmussen@broadrch.com -> thea rasmussen -> Thea Rasmussen
-    """
     email = (email or "").strip()
     if "@" not in email:
         return ""
@@ -74,19 +68,21 @@ def display_from_email(email: str) -> str:
     local = re.sub(r"[._\-]+", " ", local).strip()
     return " ".join(w.capitalize() for w in local.split() if w)
 
+
 def looks_like_email(s: str) -> bool:
     s = (s or "").strip()
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s))
 
+
 def extract_first_json_object(text: str) -> str:
     """
-    Extract the first top-level JSON object from a string.
-    Handles cases where the model returns extra text before/after the JSON.
-    Raises ValueError if no JSON object is found.
+    Extract the first top-level JSON object from a string, even if there’s extra text.
     """
     s = (text or "").strip()
+    if not s:
+        raise ValueError("Empty model output")
 
-    # Fast path: already looks like a standalone JSON object
+    # Fast path
     if s.startswith("{") and s.endswith("}"):
         return s
 
@@ -100,7 +96,6 @@ def extract_first_json_object(text: str) -> str:
 
     for i in range(start, len(s)):
         ch = s[i]
-
         if in_str:
             if esc:
                 esc = False
@@ -120,22 +115,41 @@ def extract_first_json_object(text: str) -> str:
 
     raise ValueError("Could not find a complete JSON object in model output")
 
+
+def try_parse_json_loose(raw_text: str) -> dict:
+    """
+    Robust parser:
+    1) extract_first_json_object
+    2) json.loads
+    3) if top-level is {'questions': '{...json...}'}, unwrap that
+    """
+    obj_text = extract_first_json_object(raw_text)
+    parsed = json.loads(obj_text)
+
+    # Handle annoying case: {"questions":"{ ... full schema ... }"} (stringified JSON)
+    if isinstance(parsed, dict) and len(parsed) == 1:
+        (k, v), = parsed.items()
+        if isinstance(v, str):
+            v_str = v.strip()
+            if v_str.startswith("{") and v_str.endswith("}"):
+                try:
+                    inner = json.loads(v_str)
+                    if isinstance(inner, dict) and "call_id" in inner:
+                        return inner
+                except Exception:
+                    pass
+
+    return parsed
+
+
+def clamp_str(s: str, n: int = 4000) -> str:
+    return (s or "")[:n]
+
+
 # ----------------------------
 # Speaker parsing + normalization
 # ----------------------------
 def parse_speaker_header(line: str) -> Tuple[str, str, str]:
-    """
-    Parse a speaker line like:
-      "thea.rasmussen@broadrch.com: blah"
-      "Christina Scorsis: blah"
-      "alex@regalvoice.com: blah"
-      "Patrice: blah"
-
-    Returns (display, email, domain)
-    - display: human name or email-derived display
-    - email: if present, else ""
-    - domain: if email present, else ""
-    """
     if ":" not in line:
         return "", "", ""
 
@@ -143,40 +157,27 @@ def parse_speaker_header(line: str) -> Tuple[str, str, str]:
     if not left:
         return "", "", ""
 
-    # If left is an email
     if looks_like_email(left):
         email = left
         dom = domain_from_email(email)
         display = display_from_email(email) or email
         return display, email, dom
 
-    # Otherwise treat as display name
-    display = left
-    return display, "", ""
+    return left, "", ""
+
 
 def is_regal_speaker(display: str, email: str, dom: str) -> bool:
     dom = (dom or "").lower()
     if dom and dom in REGAL_DOMAINS:
         return True
-
-    # If email is internal even if dom not parsed
     if email and domain_from_email(email) in REGAL_DOMAINS:
         return True
-
-    # If display matches known employee names (optional)
     if display and display.strip().lower() in EMPLOYEE_NAMES_LOWER:
         return True
-
     return False
 
+
 def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, str]:
-    """
-    Produce stable speaker fields while suppressing Regal.
-    speaker_type: "regal" or "prospect"
-    speaker_display: best display label
-    speaker_email: keep only for non-Regal if present
-    speaker_company: for non-Regal, prefer domain if present else "unknown"
-    """
     display = (display or "").strip()
     email = (email or "").strip()
     dom = (dom or "").strip().lower()
@@ -184,14 +185,12 @@ def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, st
     regal = is_regal_speaker(display, email, dom)
     speaker_type = "regal" if regal else "prospect"
 
-    # Display preference
+    # display normalization
     if looks_like_email(display):
-        pretty = display_from_email(display)
-        speaker_display = pretty or display
+        speaker_display = display_from_email(display) or display
     else:
         speaker_display = display or (display_from_email(email) if email else "Unknown")
 
-    # Email + company only for prospects
     speaker_email = "" if regal else (email or "")
     speaker_company = "unknown"
     if not regal:
@@ -207,20 +206,9 @@ def normalize_speaker_fields(display: str, email: str, dom: str) -> Dict[str, st
         "speaker_company": speaker_company,
     }
 
+
 def enrich_transcript_for_attribution(transcript: str) -> str:
-    """
-    Rewrite each speaker line to a consistent format that helps the model:
-      SPEAKER[prospect|regal] display=<...> email=<...> company=<...>: utterance...
-
-    Enhancements:
-    - Speaker identity memory within a single transcript:
-        If we see "Patrice" with an email once, later "Patrice:" lines inherit that email/company.
-    - Keeps original utterance unchanged.
-    - Non-speaker lines pass through unchanged.
-    """
     out_lines: List[str] = []
-
-    # In-transcript identity memory: display(lower) -> (email, domain)
     speaker_memory: Dict[str, Tuple[str, str]] = {}
 
     for raw_line in (transcript or "").splitlines():
@@ -230,7 +218,6 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
             out_lines.append(raw_line)
             continue
 
-        # Extract utterance safely
         parts = line.split(":", 1)
         if len(parts) < 2:
             out_lines.append(raw_line)
@@ -239,11 +226,8 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
 
         key = (display or "").strip().lower()
 
-        # If this line includes an email, remember it for this speaker display
         if email:
             speaker_memory[key] = (email, dom or "")
-
-        # If this line has no email, but we've seen this speaker before, inherit it
         elif key in speaker_memory:
             remembered_email, remembered_dom = speaker_memory[key]
             email = remembered_email
@@ -258,29 +242,28 @@ def enrich_transcript_for_attribution(transcript: str) -> str:
 
     return "\n".join(out_lines)
 
+
 # ----------------------------
 # Prompting
 # ----------------------------
-def build_prompt(payload: AnalyzeIn) -> str:
-    enriched = enrich_transcript_for_attribution(payload.transcript)
+def build_prompt(payload: AnalyzeIn, enriched: str, extra_strict: bool = False) -> str:
+    strict_line = ""
+    if extra_strict:
+        strict_line = (
+            "\nABSOLUTE REQUIREMENT: Return a single JSON object and NOTHING ELSE. "
+            "Do not wrap JSON in quotes. Do not nest it inside another key. Do not add any text.\n"
+        )
 
     return f"""
 You are an information extraction engine. You must output VALID JSON ONLY (no markdown, no commentary).
+Only extract items from lines labeled SPEAKER[prospect]. Ignore SPEAKER[regal] lines.
+{strict_line}
+Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript provided (including the SPEAKER[...] prefix).
+If you cannot find a verbatim quote supporting an item, omit that item. Do not infer. Do not guess.
+Do not fabricate names, integrations, compliance requirements, numbers, timelines, outcomes, or next steps.
+Return empty arrays when nothing is found.
 
-CRITICAL CREDIBILITY RULES:
-- Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript provided (including the SPEAKER[...] prefix).
-- If you cannot find a verbatim quote supporting an item, omit that item. Do not infer.
-- Do not fabricate names, integrations, compliance requirements, numbers, timelines, outcomes, or next steps.
-
-SPEAKER RULES:
-- Only extract items spoken by SPEAKER[prospect]. Ignore SPEAKER[regal].
-- Copy speaker fields exactly from the transcript prefix:
-  - speaker_display
-  - speaker_email
-  - speaker_company
-  - speaker_type ("prospect" always for extracted items)
-
-Return JSON with this schema (object at top-level):
+Return JSON with this exact schema (top-level object):
 
 {{
   "call_id": "{payload.clari_call_id or ""}",
@@ -345,8 +328,8 @@ Rules:
 - Output JSON only.
 - Keep verbatim fields short (<= 240 chars).
 - "normalized" should be reusable as a FAQ/blog title.
-- "tags" should include specific systems/terms if present in the prospect's words (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
-- topic_tags should be grounded in the transcript, not guessed.
+- "tags" should include specific systems/terms if present in prospect words (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
+- topic_tags should be grounded in transcript, not guessed.
 
 Inputs:
 clari_call_id: {payload.clari_call_id or ""}
@@ -358,45 +341,11 @@ transcript (with SPEAKER prefixes):
 {enriched}
 """.strip()
 
+
 # ----------------------------
-# Anthropic call (robust JSON parsing)
+# Anthropic call
 # ----------------------------
-def _try_json_load(s: str):
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-def _unwrap_double_encoded(obj):
-    """
-    Handles cases like:
-      {"questions": "{ ...actual schema object... }"}
-    or other single-key wrappers where the value is a JSON object encoded as a string.
-    """
-    if not isinstance(obj, dict):
-        return obj
-
-    # Common wrapper: {"questions": "{...}"}
-    if "questions" in obj and isinstance(obj["questions"], str):
-        inner = obj["questions"].strip()
-        if inner.startswith("{") and inner.endswith("}"):
-            inner_obj = _try_json_load(inner)
-            if isinstance(inner_obj, dict):
-                return inner_obj
-
-    # Generic: single-key wrapper where value is JSON object string
-    if len(obj) == 1:
-        only_val = next(iter(obj.values()))
-        if isinstance(only_val, str):
-            inner = only_val.strip()
-            if inner.startswith("{") and inner.endswith("}"):
-                inner_obj = _try_json_load(inner)
-                if isinstance(inner_obj, dict):
-                    return inner_obj
-
-    return obj
-
-def call_claude(prompt: str, max_tokens: int) -> Tuple[dict, str]:
+def call_claude_raw(prompt: str, max_tokens: int) -> str:
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": CLAUDE_API_KEY,
@@ -421,52 +370,35 @@ def call_claude(prompt: str, max_tokens: int) -> Tuple[dict, str]:
 
     data = r.json()
     content = data.get("content", [])
-
-    raw_text = ""
-    if isinstance(content, list) and content:
-        parts = []
+    parts = []
+    if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
                 parts.append(block["text"])
-        raw_text = "\n".join(parts).strip()
-
+    raw_text = "\n".join(parts).strip()
     if not raw_text:
         raise ValueError("Claude response missing text content")
+    return raw_text
 
-    # 1) Try parsing the whole thing as JSON first (handles wrapper JSON cases)
-    direct = _try_json_load(raw_text)
-    if isinstance(direct, dict):
-        unwrapped = _unwrap_double_encoded(direct)
-        if isinstance(unwrapped, dict):
-            return unwrapped, raw_text
 
-    # 2) Fall back: extract first JSON object from mixed output
-    json_text = extract_first_json_object(raw_text)
-    parsed = json.loads(json_text)
+def call_claude(prompt: str, max_tokens: int) -> Tuple[dict, str]:
+    raw_text = call_claude_raw(prompt, max_tokens)
+    parsed = try_parse_json_loose(raw_text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Model output parsed, but was not a JSON object")
+    return parsed, raw_text
 
-    if isinstance(parsed, dict):
-        unwrapped = _unwrap_double_encoded(parsed)
-        if isinstance(unwrapped, dict):
-            return unwrapped, raw_text
-
-    raise ValueError("Model output JSON was not an object")
 
 # ----------------------------
 # Routes
 # ----------------------------
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "ts": now_iso(),
-        "model": CLAUDE_MODEL,
-        "timeout_secs": CLAUDE_TIMEOUT_SECS,
-        "max_tokens": CLAUDE_MAX_TOKENS,
-    }
+    return {"ok": True, "ts": now_iso(), "model": CLAUDE_MODEL, "timeout": CLAUDE_TIMEOUT_SECS}
+
 
 @app.post("/analyze")
 def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)):
-    # Optional shared-secret gate
     if AUTH_TOKEN:
         if not authorization or authorization != f"Bearer {AUTH_TOKEN}":
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -499,59 +431,53 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "topic_tag_evidence_json": json.dumps([]),
         }
 
+    enriched = enrich_transcript_for_attribution(transcript)
+
     raw_text = ""
     try:
-        prompt = build_prompt(payload)
-        result, raw_text = call_claude(prompt, max_tokens=CLAUDE_MAX_TOKENS)
+        # First attempt
+        prompt = build_prompt(payload, enriched, extra_strict=False)
+        result, raw_text = call_claude(prompt, CLAUDE_MAX_TOKENS)
 
-        questions = result.get("questions", []) or []
-        objections = result.get("objections", []) or []
-        product_feedback = result.get("product_feedback", []) or []
-        buying_signals = result.get("buying_signals", []) or []
-        topic_tags = result.get("topic_tags", []) or []
-        summary_lines = result.get("summary_10_lines", []) or []
+    except (ValueError, json.JSONDecodeError) as e:
+        # Parsing error: retry once with extra strict + fewer tokens (reduces truncation)
+        try:
+            prompt2 = build_prompt(payload, enriched, extra_strict=True)
+            result, raw_text = call_claude(prompt2, min(CLAUDE_MAX_TOKENS, 1800))
+        except Exception as e2:
+            return {
+                "analysis_status": "error",
+                "analysis_error": str(e2)[:4000],
+                "analysis_last_run_at": now_iso(),
+                "extraction_json": "",
+                "questions_json": json.dumps([]),
+                "objections_json": json.dumps([]),
+                "product_feedback_json": json.dumps([]),
+                "buying_signals_json": json.dumps([]),
+                "summary_lines_json": json.dumps([]),
+                "topic_tags": [],
+                "top_questions_bullets": "",
+                "evidence_quotes_json": json.dumps([]),
+                "topic_tag_evidence_json": json.dumps([]),
+                "debug_model_output": clamp_str(raw_text, 4000),
+            }
 
-        # Evidence quotes from Qs/Obs, deduped
-        evidence_quotes = []
-        for q in questions[:25]:
-            if isinstance(q, dict) and q.get("evidence_quote"):
-                evidence_quotes.append(q["evidence_quote"])
-        for o in objections[:25]:
-            if isinstance(o, dict) and o.get("evidence_quote"):
-                evidence_quotes.append(o["evidence_quote"])
-
-        seen = set()
-        deduped_quotes = []
-        for q in evidence_quotes:
-            if q not in seen:
-                seen.add(q)
-                deduped_quotes.append(q)
-
-        top_bullets = []
-        for q in questions[:7]:
-            if not isinstance(q, dict):
-                continue
-            norm = q.get("normalized") or q.get("verbatim")
-            if norm:
-                top_bullets.append(f"- {norm}")
-
-        # Optional: topic tag evidence (kept empty unless you later add extraction)
-        topic_tag_evidence = result.get("topic_tag_evidence", []) or []
-
+    except (ReadTimeout, ConnectTimeout) as e:
         return {
-            "analysis_status": "processed",
-            "analysis_error": "",
+            "analysis_status": "error",
+            "analysis_error": f"Anthropic timeout: {str(e)}"[:4000],
             "analysis_last_run_at": now_iso(),
-            "extraction_json": json.dumps(result),
-            "questions_json": json.dumps(questions),
-            "objections_json": json.dumps(objections),
-            "product_feedback_json": json.dumps(product_feedback),
-            "buying_signals_json": json.dumps(buying_signals),
-            "summary_lines_json": json.dumps(summary_lines),
-            "topic_tags": topic_tags,
-            "top_questions_bullets": "\n".join(top_bullets),
-            "evidence_quotes_json": json.dumps(deduped_quotes[:25]),
-            "topic_tag_evidence_json": json.dumps(topic_tag_evidence),
+            "extraction_json": "",
+            "questions_json": json.dumps([]),
+            "objections_json": json.dumps([]),
+            "product_feedback_json": json.dumps([]),
+            "buying_signals_json": json.dumps([]),
+            "summary_lines_json": json.dumps([]),
+            "topic_tags": [],
+            "top_questions_bullets": "",
+            "evidence_quotes_json": json.dumps([]),
+            "topic_tag_evidence_json": json.dumps([]),
+            "debug_model_output": clamp_str(raw_text, 4000),
         }
 
     except Exception as e:
@@ -569,5 +495,51 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
             "topic_tag_evidence_json": json.dumps([]),
-            "debug_model_output": (raw_text[:4000] if raw_text else ""),
+            "debug_model_output": clamp_str(raw_text, 4000),
         }
+
+    # Normalize / safe defaults
+    questions = result.get("questions", []) or []
+    objections = result.get("objections", []) or []
+    product_feedback = result.get("product_feedback", []) or []
+    buying_signals = result.get("buying_signals", []) or []
+    topic_tags = result.get("topic_tags", []) or []
+    summary_lines = result.get("summary_10_lines", []) or []
+
+    # Evidence quotes (dedupe)
+    evidence_quotes: List[str] = []
+    for arr in (questions, objections, product_feedback, buying_signals):
+        for item in arr[:50]:
+            if isinstance(item, dict) and item.get("evidence_quote"):
+                evidence_quotes.append(item["evidence_quote"])
+
+    seen = set()
+    deduped_quotes = []
+    for q in evidence_quotes:
+        if q not in seen:
+            seen.add(q)
+            deduped_quotes.append(q)
+
+    top_bullets = []
+    for q in questions[:7]:
+        if isinstance(q, dict):
+            norm = q.get("normalized") or q.get("verbatim")
+            if norm:
+                top_bullets.append(f"- {norm}")
+
+    return {
+        "analysis_status": "processed",
+        "analysis_error": "",
+        "analysis_last_run_at": now_iso(),
+        "extraction_json": json.dumps(result),
+        "questions_json": json.dumps(questions),
+        "objections_json": json.dumps(objections),
+        "product_feedback_json": json.dumps(product_feedback),
+        "buying_signals_json": json.dumps(buying_signals),
+        "summary_lines_json": json.dumps(summary_lines),
+        "topic_tags": topic_tags,
+        "top_questions_bullets": "\n".join(top_bullets),
+        "evidence_quotes_json": json.dumps(deduped_quotes[:25]),
+        "topic_tag_evidence_json": json.dumps([]),
+        "debug_model_output": "",
+    }
