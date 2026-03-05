@@ -258,10 +258,20 @@ def build_prompt(payload: AnalyzeIn, enriched: str, extra_strict: bool = False) 
 You are an information extraction engine. You must output VALID JSON ONLY (no markdown, no commentary).
 Only extract items from lines labeled SPEAKER[prospect]. Ignore SPEAKER[regal] lines.
 {strict_line}
-Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript provided (including the SPEAKER[...] prefix).
-If you cannot find a verbatim quote supporting an item, omit that item. Do not infer. Do not guess.
-Do not fabricate names, integrations, compliance requirements, numbers, timelines, outcomes, or next steps.
-Return empty arrays when nothing is found.
+
+CRITICAL CREDIBILITY RULES:
+- Every extracted item MUST include an evidence_quote that is an exact, verbatim substring from the transcript provided.
+- The evidence_quote MUST begin with "SPEAKER[prospect]" and MUST be taken from exactly ONE prospect line.
+- evidence_quote MUST be SHORT: <= 320 characters. Use the smallest substring that still supports the item.
+- If you cannot find a verbatim quote supporting an item, omit that item. Do not infer. Do not guess.
+- Do not fabricate names, integrations, compliance requirements, numbers, timelines, outcomes, or next steps.
+- Return empty arrays when nothing is found.
+
+OUTPUT SIZE LIMITS (IMPORTANT):
+- Max 8 questions, 8 objections, 8 product_feedback, 8 buying_signals.
+- Keep "verbatim" <= 200 chars.
+- Keep "normalized" <= 120 chars.
+- Keep summary_10_lines exactly 10 short lines (<= 140 chars each).
 
 Return JSON with this exact schema (top-level object):
 
@@ -326,10 +336,8 @@ Return JSON with this exact schema (top-level object):
 
 Rules:
 - Output JSON only.
-- Keep verbatim fields short (<= 240 chars).
-- "normalized" should be reusable as a FAQ/blog title.
-- "tags" should include specific systems/terms if present in prospect words (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
-- topic_tags should be grounded in transcript, not guessed.
+- topic_tags MUST be grounded in the prospect transcript content.
+- tags should include specific systems/terms if present in prospect words (salesforce, hubspot, whatsapp, meta, soc2, hipaa, tcpa, data_residency).
 
 Inputs:
 clari_call_id: {payload.clari_call_id or ""}
