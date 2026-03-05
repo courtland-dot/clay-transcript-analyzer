@@ -2,7 +2,7 @@ import os
 import json
 import re
 from datetime import datetime, timezone
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, Header
@@ -51,6 +51,10 @@ class AnalyzeIn(BaseModel):
 # ----------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def clamp_str(s: str, n: int = 4000) -> str:
+    return (s or "")[:n]
 
 
 def domain_from_email(email: str) -> str:
@@ -140,10 +144,6 @@ def try_parse_json_loose(raw_text: str) -> dict:
                     pass
 
     return parsed
-
-
-def clamp_str(s: str, n: int = 4000) -> str:
-    return (s or "")[:n]
 
 
 # ----------------------------
@@ -359,7 +359,8 @@ def call_claude_raw(prompt: str, max_tokens: int) -> str:
         "messages": [{"role": "user", "content": prompt}],
     }
 
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=CLAUDE_TIMEOUT_SECS)
+    # Use json= for correct encoding + headers still fine
+    r = requests.post(url, headers=headers, json=body, timeout=CLAUDE_TIMEOUT_SECS)
 
     if r.status_code >= 400:
         try:
@@ -375,18 +376,12 @@ def call_claude_raw(prompt: str, max_tokens: int) -> str:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
                 parts.append(block["text"])
+
     raw_text = "\n".join(parts).strip()
     if not raw_text:
         raise ValueError("Claude response missing text content")
+
     return raw_text
-
-
-def call_claude(prompt: str, max_tokens: int) -> Tuple[dict, str]:
-    raw_text = call_claude_raw(prompt, max_tokens)
-    parsed = try_parse_json_loose(raw_text)
-    if not isinstance(parsed, dict):
-        raise ValueError("Model output parsed, but was not a JSON object")
-    return parsed, raw_text
 
 
 # ----------------------------
@@ -403,10 +398,13 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
         if not authorization or authorization != f"Bearer {AUTH_TOKEN}":
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+    call_id = payload.clari_call_id or ""
     transcript = payload.transcript or ""
+
+    # --- Fast path: short transcript ---
     if len(transcript) < 400:
         base = {
-            "call_id": payload.clari_call_id or "",
+            "call_id": call_id,
             "questions": [],
             "objections": [],
             "product_feedback": [],
@@ -416,6 +414,7 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "quality_flags": {"transcript_too_short": True, "low_signal": True},
         }
         return {
+            "call_id": call_id,  # ✅ top-level join key for Clay
             "analysis_status": "processed",
             "analysis_error": "",
             "analysis_last_run_at": now_iso(),
@@ -429,23 +428,38 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
             "topic_tag_evidence_json": json.dumps([]),
+            "debug_model_output": "",
         }
 
     enriched = enrich_transcript_for_attribution(transcript)
 
-    raw_text = ""
-    try:
-        # First attempt
-        prompt = build_prompt(payload, enriched, extra_strict=False)
-        result, raw_text = call_claude(prompt, CLAUDE_MAX_TOKENS)
+    raw_text_first_attempt = ""
+    raw_text_second_attempt = ""
 
-    except (ValueError, json.JSONDecodeError) as e:
-        # Parsing error: retry once with extra strict + fewer tokens (reduces truncation)
+    try:
+        # ---- Attempt 1 ----
+        prompt = build_prompt(payload, enriched, extra_strict=False)
+        raw_text_first_attempt = call_claude_raw(prompt, CLAUDE_MAX_TOKENS)
+        result = try_parse_json_loose(raw_text_first_attempt)
+
+        if not isinstance(result, dict):
+            raise ValueError("Model output parsed, but was not a JSON object")
+
+    except (ValueError, json.JSONDecodeError):
+        # ---- Attempt 2 (retry stricter + fewer tokens to reduce truncation) ----
         try:
             prompt2 = build_prompt(payload, enriched, extra_strict=True)
-            result, raw_text = call_claude(prompt2, min(CLAUDE_MAX_TOKENS, 1800))
+            raw_text_second_attempt = call_claude_raw(prompt2, min(CLAUDE_MAX_TOKENS, 1800))
+            result = try_parse_json_loose(raw_text_second_attempt)
+
+            if not isinstance(result, dict):
+                raise ValueError("Model output parsed, but was not a JSON object")
+
         except Exception as e2:
+            # Prefer the second attempt output if present, otherwise fall back to first attempt
+            debug = raw_text_second_attempt or raw_text_first_attempt
             return {
+                "call_id": call_id,
                 "analysis_status": "error",
                 "analysis_error": str(e2)[:4000],
                 "analysis_last_run_at": now_iso(),
@@ -459,11 +473,12 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
                 "top_questions_bullets": "",
                 "evidence_quotes_json": json.dumps([]),
                 "topic_tag_evidence_json": json.dumps([]),
-                "debug_model_output": clamp_str(raw_text, 4000),
+                "debug_model_output": clamp_str(debug, 4000),  # ✅ always non-empty when Claude returned something
             }
 
     except (ReadTimeout, ConnectTimeout) as e:
         return {
+            "call_id": call_id,
             "analysis_status": "error",
             "analysis_error": f"Anthropic timeout: {str(e)}"[:4000],
             "analysis_last_run_at": now_iso(),
@@ -477,11 +492,13 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
             "topic_tag_evidence_json": json.dumps([]),
-            "debug_model_output": clamp_str(raw_text, 4000),
+            "debug_model_output": clamp_str(raw_text_first_attempt, 4000),
         }
 
     except Exception as e:
+        debug = raw_text_second_attempt or raw_text_first_attempt
         return {
+            "call_id": call_id,
             "analysis_status": "error",
             "analysis_error": str(e)[:4000],
             "analysis_last_run_at": now_iso(),
@@ -495,10 +512,14 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
             "top_questions_bullets": "",
             "evidence_quotes_json": json.dumps([]),
             "topic_tag_evidence_json": json.dumps([]),
-            "debug_model_output": clamp_str(raw_text, 4000),
+            "debug_model_output": clamp_str(debug, 4000),
         }
 
+    # ----------------------------
     # Normalize / safe defaults
+    # ----------------------------
+    result["call_id"] = result.get("call_id") or call_id  # ✅ enforce call_id always present
+
     questions = result.get("questions", []) or []
     objections = result.get("objections", []) or []
     product_feedback = result.get("product_feedback", []) or []
@@ -528,6 +549,7 @@ def analyze(payload: AnalyzeIn, authorization: str | None = Header(default=None)
                 top_bullets.append(f"- {norm}")
 
     return {
+        "call_id": result.get("call_id", call_id),  # ✅ top-level join key
         "analysis_status": "processed",
         "analysis_error": "",
         "analysis_last_run_at": now_iso(),
